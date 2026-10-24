@@ -63,6 +63,30 @@ except Exception as _e:
     tc = None
     COACH_ERR = str(_e)
 
+# Backtesting (trade_backtest.py must be in the same folder).
+try:
+    import trade_backtest as tb
+    BT_ERR = None
+except Exception as _e:
+    tb = None
+    BT_ERR = str(_e)
+
+try:
+    import trade_replay as trp
+except Exception as _e:
+    trp = None
+
+# News alerts (news_alerts.py must be in the same folder). The GUI keeps its own state file.
+os.environ.setdefault("STATE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_news_state.json"))
+try:
+    import news_alerts as na
+    NEWS_ERR = None
+except Exception as _e:
+    na = None
+    NEWS_ERR = str(_e)
+NEWS_ID = "gui"          # the GUI is one "user" in the news state
+NEWS_EVERY_MS = 5 * 60 * 1000
+
 # Enable dark mode
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -247,6 +271,9 @@ class App(ctk.CTk):
         self.chat_hist = []
         self.coach_busy = False
         self.active_bot_label = None
+        self.news_busy = False
+        self.bt_busy = False
+        self.bt_text = ""
 
         self._build_top_bar()
         self._build_main_layout()
@@ -254,6 +281,7 @@ class App(ctk.CTk):
         threading.Thread(target=self._load_coins, daemon=True).start()
         threading.Thread(target=self._load_models, daemon=True).start()
         self._poll()
+        self.after(5000, self._news_tick)
         self.run()
 
     def _poll(self):
@@ -323,6 +351,8 @@ class App(ctk.CTk):
         
         tab_a = self.tabview.add("Analysis")
         tab_c = self.tabview.add("Coach (Ollama)")
+        tab_n = self.tabview.add("News")
+        tab_b = self.tabview.add("Backtest")
 
         self.verdict_label = ctk.CTkLabel(tab_a, text="Ready", font=("Segoe UI", 18, "bold"), anchor="w")
         self.verdict_label.pack(fill="x", padx=12, pady=(8, 2))
@@ -334,6 +364,8 @@ class App(ctk.CTk):
         self.text_analysis.pack(fill="both", expand=True, padx=8, pady=8)
 
         self._build_coach_tab(tab_c)
+        self._build_news_tab(tab_n)
+        self._build_backtest_tab(tab_b)
 
         self.status_var = ctk.StringVar(value="System Ready")
         status_bar = ctk.CTkLabel(self, textvariable=self.status_var, font=("Segoe UI", 10), text_color=MUTED, anchor="w")
@@ -409,6 +441,8 @@ class App(ctk.CTk):
         coins = load_coins()
         self.coins = coins
         self.q.put((lambda: self.symbol_cb.configure(values=coins), ()))
+        if na is not None:
+            self.q.put((self._news_fill_list, ()))
 
     def _load_models(self):
         if tc is None:
@@ -509,6 +543,352 @@ class App(ctk.CTk):
             self.q.put((self._update_active_bot_bubble, (f"\n[Error: {e}]",)))
         finally:
             self.coach_busy = False
+
+    # ---------------- News alerts ----------------
+    def _build_news_tab(self, parent):
+        if na is None:
+            ctk.CTkLabel(parent, text=f"News unavailable.\n{NEWS_ERR}", text_color=RED, justify="left").pack(
+                fill="both", expand=True, padx=12, pady=12)
+            return
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=(8, 2))
+        self.news_search = ctk.CTkEntry(row, placeholder_text="Search coin...", width=150)
+        self.news_search.pack(side="left", padx=(0, 6))
+        self.news_search.bind("<KeyRelease>", lambda _e: self._news_fill_list())
+        ctk.CTkButton(row, text="+ Current", width=76, fg_color="#3A4152", command=self._news_follow_current).pack(side="left", padx=2)
+        ctk.CTkButton(row, text="Clear all", width=70, fg_color="#3A4152", command=self._news_clear).pack(side="left", padx=2)
+
+        self.news_follow_lbl = ctk.CTkLabel(parent, text="", font=("Segoe UI", 11), text_color=AMBER, anchor="w", justify="left", wraplength=400)
+        self.news_follow_lbl.pack(fill="x", padx=12, pady=(2, 2))
+
+        self.news_list = ctk.CTkScrollableFrame(parent, height=150, fg_color=BG, border_width=1, border_color=PANEL_BORDER)
+        self.news_list.pack(fill="x", padx=8, pady=2)
+        self.news_vars = {}
+
+        row2 = ctk.CTkFrame(parent, fg_color="transparent")
+        row2.pack(fill="x", padx=8, pady=(6, 2))
+        ctk.CTkLabel(row2, text="Sensitivity:", font=("Segoe UI", 11)).pack(side="left", padx=(4, 4))
+        self.news_sens = ctk.CTkSlider(row2, from_=1, to=10, number_of_steps=9, width=110, command=self._news_sens)
+        self.news_sens.set(na.get_user(NEWS_ID).get("threshold", na.DEFAULT_THRESHOLD))
+        self.news_sens.pack(side="left", padx=4)
+        self.news_sens_lbl = ctk.CTkLabel(row2, text="", font=("Segoe UI", 11), text_color=MUTED, width=70)
+        self.news_sens_lbl.pack(side="left")
+        ctk.CTkButton(row2, text="Check now", width=80, command=lambda: self._news_check(True)).pack(side="right", padx=2)
+        ctk.CTkButton(row2, text="Today", width=60, fg_color="#3A4152", command=self._news_latest).pack(side="right", padx=2)
+
+        self.news_auto = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(parent, text="Auto-check every 5 min (today's news only)", variable=self.news_auto,
+                      font=("Segoe UI", 11)).pack(anchor="w", padx=12, pady=(4, 2))
+
+        self.news_box = ctk.CTkTextbox(parent, font=("Segoe UI", 11), fg_color=BG, border_width=1,
+                                       border_color=PANEL_BORDER, wrap="word")
+        self.news_box.pack(fill="both", expand=True, padx=8, pady=8)
+        self.news_box.insert("end", "Tick coins in the list. High-impact news from today shows up here with a popup.\n")
+        self._news_fill_list()
+        self._news_refresh_labels()
+
+    def _news_symbols(self):
+        syms = [c[:-4] if c.endswith("USDT") else c for c in self.coins]
+        mine = na.get_user(NEWS_ID)["coins"]
+        return syms + [c for c in mine if c not in syms]
+
+    def _news_fill_list(self):
+        if na is None or not hasattr(self, "news_list"):
+            return
+        for w in self.news_list.winfo_children():
+            w.destroy()
+        mine = set(na.get_user(NEWS_ID)["coins"])
+        flt = self.news_search.get().strip().upper()
+        self.news_vars = {}
+        shown = [s for s in self._news_symbols() if flt in s][:90]
+        for i, sym in enumerate(shown):
+            var = ctk.BooleanVar(value=sym in mine)
+            self.news_vars[sym] = var
+            ctk.CTkCheckBox(self.news_list, text=sym, variable=var, width=90, checkbox_width=18, checkbox_height=18,
+                            command=lambda s=sym: self._news_toggle(s)).grid(row=i // 3, column=i % 3, padx=6, pady=3, sticky="w")
+
+    def _news_toggle(self, sym):
+        if self.news_vars[sym].get():
+            na.follow(NEWS_ID, [sym])
+            self._news_check(True)
+        else:
+            na.unfollow(NEWS_ID, [sym])
+        self._news_refresh_labels()
+
+    def _news_refresh_labels(self):
+        u = na.get_user(NEWS_ID)
+        self.news_follow_lbl.configure(text="Following: " + (", ".join(u["coins"]) or "nothing yet"))
+        self.news_sens_lbl.configure(text=f"alert >= {u['threshold']}/10")
+
+    def _news_follow_current(self):
+        na.follow(NEWS_ID, [self.symbol_var.get()])
+        self._news_fill_list()
+        self._news_refresh_labels()
+        self._news_check(True)
+
+    def _news_clear(self):
+        na.unfollow(NEWS_ID, na.get_user(NEWS_ID)["coins"])
+        self._news_fill_list()
+        self._news_refresh_labels()
+
+    def _news_sens(self, v):
+        na.set_threshold(NEWS_ID, round(v))
+        self._news_refresh_labels()
+
+    def _news_tick(self):
+        if na is not None and self.news_auto.get():
+            self._news_check(False)
+        self.after(NEWS_EVERY_MS, self._news_tick)
+
+    def _news_check(self, manual=False):
+        if na is None or self.news_busy:
+            return
+        if not na.get_user(NEWS_ID)["coins"]:
+            if manual:
+                self.status_var.set("News: follow a coin first.")
+            return
+        self.news_busy = True
+
+        def work():
+            msg = None
+            try:
+                n = na.run_check(lambda _cid, text: self.q.put((self._news_alert, (text,))))
+                if manual or n:
+                    msg = f"News check done: {n} new alert(s) today ({na.LAST[0]}/{na.LAST[1]} sources answered)."
+            except Exception as e:
+                msg = f"News check failed: {e}"
+            self.q.put((self._news_done, (msg,)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _news_done(self, msg):
+        self.news_busy = False
+        if msg:
+            self.status_var.set(msg)
+
+    def _news_latest(self):
+        coins = na.get_user(NEWS_ID)["coins"]
+        if not coins:
+            self.status_var.set("News: follow a coin first.")
+            return
+        self.status_var.set("Fetching latest news...")
+
+        def work():
+            try:
+                items = na.latest_for(coins)
+                text = "\n\n".join(items) if items else "No news about your coins today yet."
+            except Exception as e:
+                text = f"[Could not fetch news: {e}]"
+            self.q.put((self._news_show, (text,)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _news_show(self, text):
+        self.news_box.delete("1.0", "end")
+        self.news_box.insert("end", text + "\n")
+        self.status_var.set("Latest news loaded.")
+
+    def _news_alert(self, text):
+        self.news_box.insert("1.0", text + "\n" + "-" * 48 + "\n\n")
+        self.status_var.set("News alert: " + text.split("\n")[0])
+        self.bell()
+        self._news_popup(text)
+
+    def _news_popup(self, text):
+        try:
+            win = ctk.CTkToplevel(self)
+            win.title("News alert")
+            win.geometry("420x230+40+40")
+            win.attributes("-topmost", True)
+            win.configure(fg_color=PANEL)
+            ctk.CTkLabel(win, text=text.split("\nSource:")[0], wraplength=390, justify="left",
+                         font=("Segoe UI", 12)).pack(fill="both", expand=True, padx=14, pady=(14, 6))
+            ctk.CTkButton(win, text="Dismiss", command=win.destroy).pack(pady=(0, 12))
+            win.after(15000, lambda: win.winfo_exists() and win.destroy())
+        except Exception:
+            pass
+
+    # ---------------- Backtest ----------------
+    def _build_backtest_tab(self, parent):
+        if tb is None:
+            ctk.CTkLabel(parent, text=f"Backtest unavailable.\n{BT_ERR}", text_color=RED, justify="left").pack(
+                fill="both", expand=True, padx=12, pady=12)
+            return
+        r1 = ctk.CTkFrame(parent, fg_color="transparent")
+        r1.pack(fill="x", padx=4, pady=(6, 2))
+        ctk.CTkLabel(r1, text="Strategy:", font=("Segoe UI", 11)).pack(side="left", padx=(4, 4))
+        self.bt_strategy = ctk.StringVar(value="all")
+        ctk.CTkOptionMenu(r1, variable=self.bt_strategy, values=["all"] + list(tb.STRATEGIES), width=130).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(r1, text="Years:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 4))
+        self.bt_years = ctk.StringVar(value="2")
+        ctk.CTkOptionMenu(r1, variable=self.bt_years, values=["1", "2", "3"], width=60).pack(side="left")
+
+        r2 = ctk.CTkFrame(parent, fg_color="transparent")
+        r2.pack(fill="x", padx=4, pady=2)
+        ctk.CTkLabel(r2, text="Mode:", font=("Segoe UI", 11)).pack(side="left", padx=(4, 4))
+        self.bt_mode = ctk.StringVar(value="Default")
+        ctk.CTkOptionMenu(r2, variable=self.bt_mode, values=["Default", "Optimize", "Walk-forward"], width=120).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(r2, text="Risk %:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 4))
+        self.bt_risk = ctk.CTkEntry(r2, width=44)
+        self.bt_risk.insert(0, "1")
+        self.bt_risk.pack(side="left")
+
+        r3 = ctk.CTkFrame(parent, fg_color="transparent")
+        r3.pack(fill="x", padx=4, pady=(4, 2))
+        self.bt_btn = ctk.CTkButton(r3, text="Run backtest", font=("Segoe UI", 11, "bold"), fg_color=BLUE, command=self._bt_run)
+        self.bt_btn.pack(side="left", padx=(4, 6))
+        ctk.CTkButton(r3, text="Explain with Coach", fg_color="#3A4152", command=self._bt_to_coach).pack(side="left")
+
+        ctk.CTkLabel(parent, text="Uses the coin and TF from the top bar. Default = fixed settings, Optimize = fit on 70% and "
+                                  "judge on the unseen 30%, Walk-forward = re-fit before each test window.",
+                     font=("Segoe UI", 10), text_color=MUTED, wraplength=420, justify="left", anchor="w").pack(fill="x", padx=10, pady=(2, 2))
+
+        chart = ctk.CTkFrame(parent, fg_color=PANEL, corner_radius=8, border_width=1, border_color=PANEL_BORDER)
+        chart.pack(fill="x", padx=8, pady=4)
+        self.bt_fig = Figure(figsize=(4.4, 2.2), dpi=100)
+        self.bt_canvas = FigureCanvasTkAgg(self.bt_fig, master=chart)
+        self.bt_canvas.get_tk_widget().pack(fill="x", padx=2, pady=2)
+        self._bt_draw({})
+
+        self.bt_cards = ctk.CTkScrollableFrame(parent, fg_color=BG, border_width=1, border_color=PANEL_BORDER, corner_radius=8)
+        self.bt_cards.pack(fill="both", expand=True, padx=8, pady=(4, 4))
+        self.bt_details_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(parent, text="Show full technical report", variable=self.bt_details_var, font=("Segoe UI", 10),
+                      command=self._bt_toggle_details).pack(anchor="w", padx=12, pady=(0, 6))
+        self.bt_box = ctk.CTkTextbox(parent, height=220, font=("Consolas", 10), fg_color=BG, border_width=1,
+                                     border_color=PANEL_BORDER, wrap="word")      # shown only when the switch is on
+        self.bt_res = None
+        self.replays = []
+        self._bt_message("Pick a strategy and press Run backtest.\nThe first run downloads and caches history "
+                         "(a minute or so); later runs are fast.\nThen press 'Watch the trades' to see every entry on the chart.")
+
+    def _bt_draw(self, curves):
+        fig = self.bt_fig
+        fig.clear()
+        fig.patch.set_facecolor(PANEL)
+        ax = fig.add_subplot(111)
+        style_ax(ax)
+        drawn = False
+        for i, (name, (r, split)) in enumerate(curves.items()):
+            if len(r) == 0:
+                continue
+            cum = np.r_[0.0, np.cumsum(r)]
+            ax.plot(cum, color=LINE_COLORS[i % len(LINE_COLORS)], lw=1.4, label=name)
+            if split and 0 < split < len(r):
+                ax.axvline(split, color=MUTED, ls=":", lw=0.8)
+            drawn = True
+        ax.axhline(0, color="#9AA3B5", lw=0.8)
+        ax.set_title("Cumulative R after costs" + ("  (dotted line = last 30% starts)" if drawn else ""),
+                     color=FG, fontsize=9, loc="left")
+        ax.set_xlabel("trade #", color=MUTED, fontsize=8)
+        if drawn:
+            ax.legend(loc="upper left", fontsize=7, facecolor=PANEL, edgecolor=PANEL_BORDER, labelcolor=FG)
+        else:
+            ax.text(0.5, 0.5, "no results yet", transform=ax.transAxes, ha="center", color=MUTED, fontsize=9)
+        fig.subplots_adjust(left=0.11, right=0.97, top=0.88, bottom=0.2)
+        self.bt_canvas.draw_idle()
+
+    def _bt_run(self):
+        if tb is None or self.bt_busy:
+            return
+        try:
+            sym = normalize_symbol(self.symbol_var.get())
+            tf = self.interval_var.get()
+            if tf not in tb.TF_MIN:
+                raise ValueError(f"Backtests do not support the '{tf}' timeframe. Pick 1m-1w in the top bar.")
+            risk = float(self.bt_risk.get().replace(",", "."))
+            if not 0.05 <= risk <= 10:
+                raise ValueError("Risk % must be between 0.05 and 10.")
+            years = float(self.bt_years.get())
+        except Exception as e:
+            self.status_var.set(f"Backtest: {e}")
+            return
+        mode = {"Default": "default", "Optimize": "optimize", "Walk-forward": "walkforward"}[self.bt_mode.get()]
+        strat = self.bt_strategy.get()
+        self.symbol_var.set(sym)
+        self.bt_busy = True
+        self.bt_btn.configure(state="disabled")
+        self.status_var.set(f"Backtest started: {sym} {tf}...")
+
+        def work():
+            try:
+                res = tb.run_backtest(sym, tf, strat, mode, years, risk, False,
+                                      progress=lambda m: self.q.put((self.status_var.set, (m,))))
+                self.q.put((self._bt_show, (res,)))
+            except Exception as e:
+                self.q.put((self._bt_error, (e,)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _bt_toggle_details(self):
+        if self.bt_details_var.get():
+            self.bt_box.pack(fill="x", padx=8, pady=(0, 8))
+        else:
+            self.bt_box.pack_forget()
+
+    def _bt_message(self, text, color=MUTED):
+        for w in self.bt_cards.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(self.bt_cards, text=text, font=("Segoe UI", 11), text_color=color, wraplength=390,
+                     justify="left", anchor="w").pack(fill="x", padx=8, pady=8)
+
+    def _bt_show(self, res):
+        self.bt_res = res
+        self.bt_text = res["text"]
+        self._bt_draw(res["curves"])
+        self.bt_box.delete("1.0", "end")
+        self.bt_box.insert("end", res["text"] + "\n")
+        self._bt_fill_cards(res)
+        self.bt_busy = False
+        self.bt_btn.configure(state="normal")
+        self.status_var.set("Backtest finished.")
+
+    def _bt_fill_cards(self, res):
+        for w in self.bt_cards.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(self.bt_cards, text="R = the money you risk on one trade (distance to your stop). "
+                                         "+2R = you made twice what you risked, -1R = you lost it.",
+                     font=("Segoe UI", 10), text_color=MUTED, wraplength=390, justify="left", anchor="w").pack(fill="x", padx=8, pady=(2, 6))
+        colors = {"good": GREEN, "bad": RED, "maybe": AMBER, "nodata": MUTED}
+        for card in res["cards"]:
+            colr = colors[card["kind"]]
+            f = ctk.CTkFrame(self.bt_cards, fg_color=PANEL, corner_radius=8, border_width=1, border_color=colr)
+            f.pack(fill="x", padx=4, pady=5)
+            head = ctk.CTkFrame(f, fg_color="transparent")
+            head.pack(fill="x", padx=8, pady=(6, 0))
+            ctk.CTkLabel(head, text=card["name"], font=("Segoe UI", 13, "bold")).pack(side="left")
+            ctk.CTkLabel(head, text=card["badge"], font=("Segoe UI", 10, "bold"), text_color="#0B0E14",
+                         fg_color=colr, corner_radius=6, width=110).pack(side="right")
+            for line in card["lines"]:
+                ctk.CTkLabel(f, text=line, font=("Segoe UI", 11), wraplength=380, justify="left", anchor="w",
+                             text_color=FG).pack(fill="x", padx=10, pady=1)
+            ctk.CTkButton(f, text="▶ Watch the trades", fg_color=BLUE, height=28,
+                          state="normal" if card["has_trades"] and trp is not None else "disabled",
+                          command=lambda n=card["name"]: self._bt_open_replay(n)).pack(anchor="w", padx=10, pady=(6, 8))
+
+    def _bt_open_replay(self, name):
+        if trp is None or not self.bt_res:
+            self.status_var.set("Replay unavailable: trade_replay.py must be in the same folder.")
+            return
+        res = self.bt_res
+        w = trp.ReplayWindow(self, res["df"], res["trades"][name], title=f"{res['symbol']} {res['tf']} · {name}")
+        self.replays.append(w)
+
+    def _bt_error(self, e):
+        self.bt_busy = False
+        self.bt_btn.configure(state="normal")
+        self.status_var.set(f"Backtest failed: {e}")
+        self._bt_message(f"Backtest failed: {e}", RED)
+
+    def _bt_to_coach(self):
+        if tc is None:
+            self.status_var.set("Coach is unavailable.")
+            return
+        if not self.bt_text:
+            self.status_var.set("Run a backtest first.")
+            return
+        self.tabview.set("Coach (Ollama)")
+        q = ("Here are my backtest results. Use only these numbers.\n\n" + self.bt_text[:5000] +
+             "\n\nIn plain language: is there evidence of an edge, how reliable is it, what could go wrong, "
+             "and how much should I risk?")
+        self._coach_send(q, "Interpret my backtest results.")
 
     def _coach_clear(self):
         self.chat_hist = []

@@ -1,0 +1,8 @@
+[project]
+name = "trade-assistant"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[tool.pyrefly]
+python-interpreter-path = "C:/Users/nourb/AppData/Local/Programs/Python/Python313/python.exe"
+search-path = [".", "tests"]
