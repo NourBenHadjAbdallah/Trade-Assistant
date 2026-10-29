@@ -13,3 +13,6 @@ gui_news_state.json
 state.json
 .icon_cache/
 cache/*.csv
+
+# graphify internal cache (rebuilt by `graphify update .`)
+graphify-out/cache/
