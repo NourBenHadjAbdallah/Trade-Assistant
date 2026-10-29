@@ -6,8 +6,15 @@
   "4": "trade_chat.py",
   "5": "test_audit.py",
   "6": "trade_assistant_gui.py",
+  "7": "pandas",
   "8": "Comprehensive Audit Report: Quantitative Integrity, Statistics & Code Review",
-  "9": "ReplayWindow",
+  "9": "signal_log.py",
   "10": "CLAUDE.md",
-  "11": "trade-assistant"
+  "11": "trade-assistant",
+  "12": "test_signal_log.py",
+  "13": "fetch_history",
+  "14": "analyse",
+  "15": "confluence_filters",
+  "16": "backtest",
+  "17": "_get_klines"
 }

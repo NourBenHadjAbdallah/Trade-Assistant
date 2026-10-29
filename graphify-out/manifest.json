@@ -48,9 +48,9 @@
     "semantic_hash": ""
   },
   "trade_ai.py": {
-    "mtime": 1793292745.8817904,
-    "seen": 1793292848.45552,
-    "ast_hash": "e453e710ef8b1c05246baf5262f52bda",
+    "mtime": 1793293402.5777316,
+    "seen": 1793293919.365196,
+    "ast_hash": "ae88b712e933ba239e70e13b2dc28ff1",
     "semantic_hash": ""
   },
   "trade_assistant.py": {
@@ -60,9 +60,9 @@
     "semantic_hash": ""
   },
   "trade_assistant_gui.py": {
-    "mtime": 1793292772.8323758,
-    "seen": 1793292848.4555266,
-    "ast_hash": "7fed69c917f4386687839b6d1f6a219d",
+    "mtime": 1793293906.8498816,
+    "seen": 1793293919.3652027,
+    "ast_hash": "8433adb0e9295e3bd07c17b538efc8b9",
     "semantic_hash": ""
   },
   "trade_backtest.py": {
@@ -129,6 +129,18 @@
     "mtime": 1793292691.5759187,
     "seen": 1793292848.4554954,
     "ast_hash": "3dfd34a05ac549fc08539fced0706f98",
+    "semantic_hash": ""
+  },
+  "signal_log.py": {
+    "mtime": 1793293447.898157,
+    "seen": 1793293919.3651836,
+    "ast_hash": "cbfd869789add5c89f1584e60f9c94e6",
+    "semantic_hash": ""
+  },
+  "tests/test_signal_log.py": {
+    "mtime": 1793293553.480751,
+    "seen": 1793293919.3651917,
+    "ast_hash": "88b4f286618b38c756d8278eb0a4c236",
     "semantic_hash": ""
   }
 }
