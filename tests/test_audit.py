@@ -1,13 +1,12 @@
 """
-tests/test_audit.py - Unit test suite for Phase 1 Audit.
+tests/test_audit.py - regression tests for the audit findings (AUDIT.md).
 Verifies:
 1. No-edge test: Random walk data must yield <= 0 expectancy after costs.
 2. Cost drag quantification on narrow stops.
-3. Audit findings & edge-case behavior (gaps, drawdown math, Kelly sizing, cache truncation).
+3. The audit bugs stay fixed (gap fills, drawdown math, Kelly sizing, cache truncation, revenge trades).
+4. Recommendation engine and Claude coach helpers.
 """
-import os
 import sys
-import tempfile
 from pathlib import Path
 
 # Ensure project root is in sys.path regardless of execution context
@@ -111,10 +110,9 @@ def test_cost_drag_proportional_to_stop_width():
 # ----------------------------------------------------------------------------
 # 3. GAP EXECUTION REALISM
 # ----------------------------------------------------------------------------
-def test_gap_stop_loss_unrealistic_fill():
+def test_gap_stop_fills_at_open():
     """
-    Audit Finding 2.1: The engine fills stops at exactly -1.0R even when the candle
-    gaps far below the stop price.
+    Audit FLAW-02 (fixed): a candle that opens beyond the stop fills at its open, not at the stop.
     """
     times = pd.date_range("2024-01-01", periods=25, freq="1h")
     # 25 bars so ATR(14) is warm.
@@ -156,13 +154,9 @@ def test_gap_stop_loss_unrealistic_fill():
         assert len(trades) == 1
         trade = trades.iloc[0]
         
-        # In reality: entry 100, gap open 80, risk ~2.0 -> loss should be (80-100)/2 = -10.0R!
-        # But current engine fills at exactly -1.0R:
-        raw_r = trade["r"]
-        # Document that the engine currently registers -1.0R instead of gap loss
-        assert raw_r == pytest.approx(-1.0, rel=1e-3), (
-            f"Engine filled at {raw_r}R; gap through stop should be -10.0R in realistic execution."
-        )
+        # entry 100, ATR 2 -> stop 98; bar 16 opens at 80 -> fill 80 -> (80 - 100) / 2 = -10R
+        assert trade["reason"] == "stop"
+        assert trade["r"] == pytest.approx(-10.0, rel=1e-3)
     finally:
         tb.STRATEGIES.pop("gap_test", None)
 
@@ -170,11 +164,9 @@ def test_gap_stop_loss_unrealistic_fill():
 # ----------------------------------------------------------------------------
 # 4. MONTE CARLO DRAWDOWN CALCULATION FLAW
 # ----------------------------------------------------------------------------
-def test_monte_carlo_drawdown_missing_initial_equity():
+def test_monte_carlo_drawdown_counts_from_starting_equity():
     """
-    Audit Finding 3.1: In monte_carlo(), eq = 100 * cumprod(...).
-    If the simulation path starts with losses, np.maximum.accumulate(eq)
-    starts from eq[0] (e.g. 99), ignoring the starting 100 capital.
+    Audit STAT-04 (fixed): drawdown is measured from the starting balance (100), not the first trade.
     """
     # Force consecutive losses of -1.0R
     r = np.array([-1.0] * 20)
@@ -182,21 +174,16 @@ def test_monte_carlo_drawdown_missing_initial_equity():
     mc = tb.monte_carlo(r, n_trades=5, risk_pct=1.0, sims=10, seed=42)
     assert mc is not None
     
-    # Expected drawdown from starting capital 100 to 100*(0.99)^5 = 95.099 -> DD = 4.90%
-    # But because eq starts at 99, current calculation is (99 - 95.099)/99 = 3.94%
-    assert mc["median_dd"] < 4.5, (
-        f"Current median_dd is {mc['median_dd']:.2f}%, which underestimates the 4.90% drawdown "
-        f"because starting equity 100 is omitted from maximum.accumulate."
-    )
+    # 100 -> 100 * 0.99^5 = 95.099 -> drawdown 4.90%
+    assert mc["median_dd"] == pytest.approx(100 * (1 - 0.99 ** 5), rel=1e-6)
 
 
 # ----------------------------------------------------------------------------
 # 5. KELLY CRITERION SIZING WITH NO EDGE
 # ----------------------------------------------------------------------------
-def test_kelly_sizing_allows_risk_without_statistical_edge():
+def test_kelly_zero_without_statistical_edge():
     """
-    Audit Finding 3.2: kelly() allows up to 0.5% risk even when exp_ci[0] <= 0
-    (the 95% confidence interval includes zero, meaning no statistically validated edge).
+    Audit STAT-03 (fixed): no risk is suggested while the 95% range still includes zero.
     """
     # Sample with positive sample mean (+0.05R) but wide confidence interval [-0.15, +0.25]
     dummy_stats = {
@@ -207,37 +194,30 @@ def test_kelly_sizing_allows_risk_without_statistical_edge():
         "expectancy": 0.05,
         "exp_ci": (-0.15, 0.25),  # Lower bound <= 0
     }
-    size = tb.kelly(dummy_stats)
-    # Currently suggests 0.50% risk instead of 0.0%
-    assert size > 0.0, f"Kelly returned {size}%, confirming it allocates risk without proven edge."
+    assert tb.kelly(dummy_stats) == 0.0
+    proven = {**dummy_stats, "n": 300, "expectancy": 0.25, "exp_ci": (0.05, 0.45)}
+    assert 0.0 < tb.kelly(proven) <= 2.0
 
 
 # ----------------------------------------------------------------------------
 # 6. CACHE FILE TRUNCATION ON REPEATED OFFLINE CALLS
 # ----------------------------------------------------------------------------
-def test_fetch_history_cache_truncation_logic():
+def test_fetch_history_keeps_cache_when_nothing_new(monkeypatch, tmp_path):
     """
-    Audit Finding 1.2: In fetch_history, `df = df.iloc[:-1]` is executed on every call,
-    even when no new candles were downloaded, truncating cached data.
+    Audit BUG-01 (fixed): a run that downloads nothing must not shave a candle off the cache.
     """
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        fake_path = os.path.join(tmp_dir, "TEST_1h.csv")
-        original_df = pd.DataFrame({
-            "time": pd.date_range("2024-01-01", periods=10, freq="1h"),
-            "open": range(10), "high": range(10), "low": range(10),
-            "close": range(10), "volume": range(10), "buy_volume": range(10)
-        })
-        original_df.to_csv(fake_path, index=False)
-        
-        # Simulate what line 94-98 does when new is None:
-        old = pd.read_csv(fake_path, parse_dates=["time"])
-        new = None
-        df = pd.concat([x for x in (old, new) if x is not None], ignore_index=True)
-        df_truncated = df.iloc[:-1]
-        
-        assert len(df_truncated) == len(original_df) - 1, (
-            "Confirmed: concatenation without new data drops 1 candle from cache."
-        )
+    monkeypatch.setattr(tb, "CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(tb, "_get_klines", lambda params: [])
+    end = pd.Timestamp.now(tz="UTC").tz_localize(None).floor("h") - pd.Timedelta(hours=2)
+    cached = pd.DataFrame({"time": pd.date_range(end=end, periods=10, freq="1h"),
+                           "open": range(10), "high": range(10), "low": range(10),
+                           "close": range(10), "volume": range(10), "buy_volume": range(10)})
+    path = tmp_path / "TEST_1h.csv"
+    cached.to_csv(path, index=False)
+    for _ in range(3):
+        out = tb.fetch_history("TEST", "1h", years=1.0)
+    assert len(out) == 10
+    assert len(pd.read_csv(path)) == 10
 
 
 # ----------------------------------------------------------------------------
@@ -245,9 +225,8 @@ def test_fetch_history_cache_truncation_logic():
 # ----------------------------------------------------------------------------
 def test_trade_journal_revenge_overlapping_trades():
     """
-    Audit Finding 5.1: trade_journal.stats() sorts by open_time when checking for revenge trades:
-    `p, t = ordered.iloc[i - 1], ordered.iloc[i]`.
-    When multiple positions overlap, i-1 is not the trade that just closed.
+    Audit BUG-09 (fixed): a trade opened right after a losing close counts as revenge,
+    even when another position overlapped in between.
     """
     trades_data = pd.DataFrame([
         # Trade 0: opens 10:00, closes 12:00 (loss)
@@ -264,7 +243,34 @@ def test_trade_journal_revenge_overlapping_trades():
     trades_data["close_time"] = pd.to_datetime(trades_data["close_time"])
     st = tj.stats(trades_data)
     assert st is not None
-    # Trade 2 opened 10 min after Trade 0 closed at a loss.
-    # But because sorted by open_time, Trade 2 is compared against Trade 1 (closed at 11:00, gap 70 min)!
-    # Thus Trade 2 revenge count is missed (revenge_n == 0):
-    assert st["revenge_n"] == 0, "Confirmed: overlapping positions cause revenge trading detector to miss revenge trades."
+    # Trade 2 opened 10 min after Trade 0 closed at a loss
+    assert st["revenge_n"] == 1
+
+
+# ----------------------------------------------------------------------------
+# 8. RECOMMENDATIONS AND CLAUDE COACH
+# ----------------------------------------------------------------------------
+def test_recommend_and_scan_on_demo_data():
+    import trade_ai as ai
+    rows = ai.scan(ai.demo_provider, ["AAA", "BBB"], "Swing", workers=2)
+    assert len(rows) == 2 and all(r["error"] is None for r in rows)
+    assert [ai.scan_key(r) for r in rows] == sorted(ai.scan_key(r) for r in rows)
+    rec = rows[0]["rec"]
+    assert rec["action"] in ("BUY", "SELL", "WAIT FOR ENTRY", "AVOID", "STAND ASIDE")
+    assert rec["max_risk_pct"] <= 1.0 and isinstance(rec["pro"], list) and isinstance(rec["con"], list)
+
+
+def test_claude_transcript_and_mode(monkeypatch):
+    import claude_coach as cc
+    msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "entry?"}]
+    t = cc._transcript(msgs)
+    assert "User: hi" in t and "Coach: hello" in t and t.endswith("entry?")
+    assert cc._transcript(msgs[:1]) == "hi"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    assert cc.mode() == "api"
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.setattr(cc, "cli_path", lambda: None)
+    assert cc.mode() is None
+    with pytest.raises(RuntimeError):
+        cc.ask("sys", msgs)

@@ -17,21 +17,16 @@ CLI:
     python trade_ai.py --demo --style Swing
     python trade_ai.py --symbol ETHUSDT --style Scalp --account 2000 --risk 0.5
 
-LLM coach (optional): set ANTHROPIC_API_KEY (and optionally TRADE_AI_MODEL).
+Coach (optional): --explain asks the coach in trade_chat.py (local Ollama by default, --backend claude for Claude).
 """
 import argparse
-import json
-import os
-
-import config  # noqa: F401  (loads .env before os.environ is read)
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
 
 import trade_assistant as ta
 import trade_backtest as tb
-
-DEFAULT_MODEL = os.environ.get("TRADE_AI_MODEL", "claude-sonnet-5-5")
 
 # (higher timeframe, setup timeframe, trigger timeframe)
 STYLES = {
@@ -333,9 +328,11 @@ def position_size(account, risk_pct, entry, risk):
 def build_plan(provider, symbol, style="Intraday", account=1000.0, risk_pct=1.0):
     """provider(symbol, interval) -> DataFrame (same schema as trade_assistant)."""
     tfs = STYLES[style]
+    with ThreadPoolExecutor(len(tfs)) as ex:          # the 3 downloads are the slow part: run them together
+        dfs = list(ex.map(lambda tf: provider(symbol, tf), tfs))
     snaps = []
-    for tf, role in zip(tfs, ROLES):
-        s = snapshot(provider(symbol, tf), tf)
+    for df, tf, role in zip(dfs, tfs, ROLES):
+        s = snapshot(df, tf)
         s["role"] = role
         snaps.append(s)
     low, mid, top = snaps                      # ordered low -> high
@@ -401,7 +398,7 @@ def build_plan(provider, symbol, style="Intraday", account=1000.0, risk_pct=1.0)
         plan["confidence"] = {"score": score, "label": lab, "factors": factors}
 
         # invalidation
-        hi, lo = pivots(provider(symbol, top["tf"]))
+        hi, lo = pivots(top["_raw"]["df"])           # reuse the candles already downloaded for the snapshot
         plan["invalidation"].append(f"{mid['tf']} closes beyond the stop {lv['stop']:.6g}: the idea is wrong, exit.")
         if d > 0 and lo and lo[-1][1] < top["price"]:
             plan["invalidation"].append(f"{top['tf']} structure breaks: close below its last swing low {lo[-1][1]:.6g}.")
@@ -551,8 +548,6 @@ GRADE_RANK = {"strong": 0, "actionable": 1, "forming": 2, "skip": 3, "none": 4}
 
 def scan(provider, symbols, style="Intraday", workers=4, on_result=None):
     """Build plan + recommendation for many coins in parallel. Returns rows sorted best first."""
-    from concurrent.futures import ThreadPoolExecutor
-
     def one(sym):
         try:
             plan = build_plan(provider, sym, style)
@@ -681,65 +676,8 @@ def offline_answer(question, plan, journal_text=None):
         return "\n".join(plan["avoid"])
     # default: why
     lines = [plan["verdict"], plan["strategy"]["name"]] + plan["strategy"]["why"]
-    lines.append("(Set ANTHROPIC_API_KEY or paste a key in the Coach tab for free-form conversation in Arabic, French or English.)")
+    lines.append("(Start Ollama, or choose Claude in the Coach tab, for free-form conversation in Arabic, French or English.)")
     return "\n".join(lines)
-
-
-# ----------------------------------------------------------------------------
-# LLM coach (Claude API)
-# ----------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are the AI strategy coach inside a crypto trading desktop app.
-The app already computed a multi-timeframe analysis (volume profile, anchored VWAP, order-flow delta/CVD, trend regime, ATR) with deterministic code. You receive it below as JSON, plus the user's trade-journal statistics when available.
-
-Rules:
-- Use ONLY numbers present in the data. Never invent prices, indicators, news or fundamentals. If something is not in the data, say so.
-- Explain in plain language, step by step: what each timeframe is doing, why this strategy was chosen, where the idea is wrong (invalidation), and how much to risk.
-- Be direct and concrete. If the user's idea fights the higher timeframe or has poor risk/reward, say so and explain why.
-- Never promise outcomes. Candle-level order flow is an approximation. At most one short reminder that this is not financial advice.
-- When journal stats show a pattern (cutting winners, revenge trading, ignoring stops), connect it to the current setup.
-- Reply in the same language the user writes in (Arabic, French or English).
-- Keep answers focused: short paragraphs or short lists."""
-
-BRIEFING_QUESTION = ("Explain this setup in plain language: the story across the timeframes, why this strategy, "
-                     "what must happen before I enter, where I'm wrong, and what mistake I'm most likely to make here.")
-
-
-def plan_to_json(plan):
-    def default(o):
-        if isinstance(o, np.bool_):
-            return bool(o)
-        if isinstance(o, (np.floating, np.integer)):
-            return float(o)
-        return str(o)
-    return json.dumps(plan, default=default, ensure_ascii=False)
-
-
-def ask_llm(question, plan, history=None, journal_text=None, api_key=None, model=None, timeout=60):
-    import requests
-    api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("No API key. Set ANTHROPIC_API_KEY or paste it in the Coach tab.")
-    system = SYSTEM_PROMPT
-    if plan is not None:
-        system += "\n\n<analysis>\n" + plan_to_json(plan) + "\n</analysis>"
-    else:
-        system += "\n\nNo analysis has been run yet."
-    if journal_text:
-        system += "\n\n<journal_stats>\n" + journal_text + "\n</journal_stats>"
-    msgs = list(history or [])[-12:] + [{"role": "user", "content": question}]
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-        json={"model": model or DEFAULT_MODEL, "max_tokens": 1500, "system": system, "messages": msgs},
-        timeout=timeout,
-    )
-    if r.status_code != 200:
-        try:
-            msg = r.json().get("error", {}).get("message", r.text)
-        except Exception:
-            msg = r.text
-        raise RuntimeError(f"API error {r.status_code}: {msg}")
-    return "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
 
 
 # ----------------------------------------------------------------------------
@@ -766,14 +704,17 @@ def main():
     p.add_argument("--account", type=float, default=1000.0)
     p.add_argument("--risk", type=float, default=1.0, help="risk per trade, percent of account")
     p.add_argument("--demo", action="store_true", help="synthetic data")
-    p.add_argument("--explain", action="store_true", help="ask the LLM coach to explain the setup")
+    p.add_argument("--explain", action="store_true", help="ask the coach to explain the setup")
+    p.add_argument("--backend", choices=("ollama", "claude"), default="ollama", help="coach used by --explain")
     a = p.parse_args()
     plan = build_plan(demo_provider if a.demo else binance_provider, a.symbol.upper(), a.style, a.account, a.risk)
     print(render_plan_text(plan))
     if a.explain:
         print("\n" + "=" * 64 + "\nAI COACH\n")
+        import trade_chat as tc                    # imported here: trade_chat imports this module
         try:
-            print(ask_llm(BRIEFING_QUESTION, plan))
+            tc.ask(tc.BRIEFING, plan, backend=a.backend, on_token=lambda t: print(t, end="", flush=True))
+            print()
         except Exception as e:
             print(f"(LLM unavailable: {e})")
             print(offline_answer("why", plan))

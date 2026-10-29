@@ -25,6 +25,7 @@ def ensure_deps():
         "customtkinter": "customtkinter",
         "PIL": "pillow",
         "dotenv": "python-dotenv",
+        "anthropic": "anthropic",
     }
     missing = []
     for mod, pkg in needed.items():
@@ -407,7 +408,7 @@ class App(ctk.CTk):
 
         tab_s = self.tabview.add("Signals")
         tab_a = self.tabview.add("Analysis")
-        tab_c = self.tabview.add("Coach (Ollama)")
+        tab_c = self.tabview.add("Coach")
         tab_n = self.tabview.add("News")
         tab_b = self.tabview.add("Backtest")
 
@@ -437,13 +438,16 @@ class App(ctk.CTk):
         controls = ctk.CTkFrame(parent, fg_color="transparent")
         controls.pack(fill="x", padx=4, pady=4)
 
-        ctk.CTkLabel(controls, text="Model:", font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w")
+        self.backend_var = ctk.StringVar(value="Ollama")
+        ctk.CTkSegmentedButton(controls, values=["Ollama", "Claude"], variable=self.backend_var,
+                               command=self._coach_backend).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(controls, text="Model:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 4))
+        self.ollama_models = [tc.DEFAULT_MODEL]
         self.model_var = ctk.StringVar(value=tc.DEFAULT_MODEL)
-        self.model_cb = ctk.CTkOptionMenu(controls, variable=self.model_var, values=[tc.DEFAULT_MODEL], width=130)
-        self.model_cb.grid(row=0, column=1, padx=4, pady=2)
-
-        ctk.CTkLabel(controls, text="(style comes from the top bar)", font=("Segoe UI", 10),
-                     text_color=MUTED).grid(row=0, column=2, sticky="w", padx=4)
+        self.model_cb = ctk.CTkOptionMenu(controls, variable=self.model_var, values=self.ollama_models, width=160)
+        self.model_cb.pack(side="left")
+        self.coach_status = text(parent, "Local and free. Uses the coin and style from the top bar.", MUTED, 10,
+                                 wrap=470, padx=8, pady=(0, 2))
 
         action_bar = ctk.CTkFrame(parent, fg_color="transparent")
         action_bar.pack(fill="x", padx=4, pady=4)
@@ -479,7 +483,7 @@ class App(ctk.CTk):
             bubble = ctk.CTkFrame(row_frame, fg_color=COACH_BUBBLE_BG, border_width=1, border_color=PANEL_BORDER, corner_radius=12)
             bubble.pack(side="left", anchor="w", padx=(0, 40))
             
-            sender_title = ctk.CTkLabel(bubble, text=f"AI Coach ({self.model_var.get()})", font=("Segoe UI", 9, "bold"), text_color=AMBER)
+            sender_title = ctk.CTkLabel(bubble, text=f"AI Coach · {self.model_var.get()}", font=("Segoe UI", 9, "bold"), text_color=AMBER)
             sender_title.pack(anchor="w", padx=10, pady=(6, 0))
             
             label = ctk.CTkLabel(bubble, text=text, font=("Segoe UI", 11), text_color=FG, wraplength=280, justify="left")
@@ -509,9 +513,24 @@ class App(ctk.CTk):
         except Exception:
             return
         if models:
+            self.ollama_models = models
+            if self.backend_var.get() == "Ollama":
+                pick = tc.DEFAULT_MODEL if tc.DEFAULT_MODEL in models else models[0]
+                self.q.put((lambda: self.model_cb.configure(values=models), ()))
+                self.model_var.set(pick)
+
+    def _coach_backend(self, choice):
+        """Ollama (default, local) or Claude (subscription via Claude Code, or API key)."""
+        if choice == "Claude":
+            models, pick = tc.cc.CLAUDE_MODELS, tc.cc.CLAUDE_MODEL
+            ready = tc.cc.mode() is not None
+            self.coach_status.configure(text=tc.cc.status_text(), text_color=MUTED if ready else AMBER)
+        else:
+            models = self.ollama_models
             pick = tc.DEFAULT_MODEL if tc.DEFAULT_MODEL in models else models[0]
-            self.q.put((lambda: self.model_cb.configure(values=models), ()))
-            self.model_var.set(pick)
+            self.coach_status.configure(text="Local and free. Uses the coin and style from the top bar.", text_color=MUTED)
+        self.model_cb.configure(values=models)
+        self.model_var.set(pick)
 
     def _toggle_auto(self):
         if self.job:
@@ -822,13 +841,24 @@ class App(ctk.CTk):
         self._add_chat_bubble(shown or q, sender="user")
         self._add_chat_bubble("", sender="bot")
 
-        threading.Thread(target=self._coach_work, args=(q, sym, self.style_var.get(), self.model_var.get().strip()), daemon=True).start()
+        threading.Thread(target=self._coach_work, args=(q, sym, self.style_var.get(), self.model_var.get().strip(),
+                                                        self.backend_var.get().lower()), daemon=True).start()
 
-    def _coach_work(self, q, sym, style, model):
+    def _coach_plan(self, sym, style):
+        """Reuse the plan for follow-up questions (same coin + style, under 2 minutes old)."""
+        key, now = (sym, style), pd.Timestamp.now()
+        cached = getattr(self, "_coach_cache", None)
+        if cached and cached[0] == key and now - cached[1] < pd.Timedelta(minutes=2):
+            return cached[2]
+        plan = tc.ai.build_plan(lambda s, tf: get_klines(s, tf, 500), sym, style, 1000.0, 1.0)
+        self._coach_cache = (key, now, plan)
+        return plan
+
+    def _coach_work(self, q, sym, style, model, backend):
         try:
-            plan = tc.ai.build_plan(lambda s, tf: get_klines(s, tf, 500), sym, style, 1000.0, 1.0)
-            ans = tc.ask_ollama(q, plan, self.chat_hist, tc.journal_text(), model=model,
-                                on_token=lambda t: self.q.put((self._update_active_bot_bubble, (t,))))
+            plan = self._coach_plan(sym, style)
+            ans = tc.ask(q, plan, self.chat_hist, tc.journal_text(), backend, model=model,
+                         on_token=lambda t: self.q.put((self._update_active_bot_bubble, (t,))))
             self.chat_hist += [{"role": "user", "content": q}, {"role": "assistant", "content": ans}]
         except Exception as e:
             self.q.put((self._update_active_bot_bubble, (f"\n[Error: {e}]",)))
@@ -1175,7 +1205,7 @@ class App(ctk.CTk):
         if not self.bt_text:
             self.status_var.set("Run a backtest first.")
             return
-        self.tabview.set("Coach (Ollama)")
+        self.tabview.set("Coach")
         q = ("Here are my backtest results. Use only these numbers.\n\n" + self.bt_text[:5000] +
              "\n\nIn plain language: is there evidence of an edge, how reliable is it, what could go wrong, "
              "and how much should I risk?")
