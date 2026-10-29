@@ -186,21 +186,62 @@ def s_mean_reversion(df, tf, rsi_lo=30, adx_max=25, **_):
     return _sig((r < rsi_lo) & (c < mid - 2 * sd) & ranging, (r > 100 - rsi_lo) & (c > mid + 2 * sd) & ranging)
 
 
-def s_htf_trend(df, tf, htf_factor=4, htf_ema=50, **_):
-    """Trade RSI-50 re-crosses only in the direction of the higher timeframe trend (no lookahead)."""
+def htf_state(df, tf, htf_factor=4, htf_ema=50):
+    """(up, dn) bool arrays: higher-timeframe trend as known at the START of each HTF bar (no lookahead)."""
     g = df.set_index("time")
     rule = f"{TF_MIN[tf] * htf_factor}min"
     hc = g["close"].resample(rule).last().dropna()
     e = ema(hc, htf_ema)
-    up = ((hc > e) & (e > e.shift(3))).shift(1)           # state known at the START of each HTF bar
+    up = ((hc > e) & (e > e.shift(3))).shift(1)
     dn = ((hc < e) & (e < e.shift(3))).shift(1)
-    up = up.reindex(g.index, method="ffill").fillna(False).astype(bool).values
-    dn = dn.reindex(g.index, method="ffill").fillna(False).astype(bool).values
+    up = up.astype(float).reindex(g.index, method="ffill").fillna(0).astype(bool).values
+    dn = dn.astype(float).reindex(g.index, method="ffill").fillna(0).astype(bool).values
+    return up, dn
+
+
+def s_htf_trend(df, tf, htf_factor=4, htf_ema=50, **_):
+    """Trade RSI-50 re-crosses only in the direction of the higher timeframe trend (no lookahead)."""
+    up, dn = htf_state(df, tf, htf_factor, htf_ema)
     r = rsi(df["close"]).values
     rp = np.r_[np.nan, r[:-1]]
     long = pd.Series(up & (rp < 50) & (r >= 50), index=df.index)
     short = pd.Series(dn & (rp > 50) & (r <= 50), index=df.index)
     return _sig(long, short)
+
+
+def confluence_filters(df, tf, htf_factor=4, adx_min=20, flow_min=0.0, **_):
+    """
+    Named bool Series per side: every independent check a 'strong' signal must pass.
+    Trend (HTF + EMA stack + ADX), pullback to EMA20 that held, decisive candle,
+    order flow (net taker delta), participation (volume), momentum not stretched, sane volatility.
+    """
+    c, o, h, l, v = (df[k] for k in ("close", "open", "high", "low", "volume"))
+    e20, e50 = ema(c, 20), ema(c, 50)
+    up, dn = (pd.Series(x, index=df.index) for x in htf_state(df, tf, htf_factor, 50))
+    rng = (h - l).replace(0, np.nan)
+    clv = ((c - l) / rng).fillna(0.5)
+    delta = 2 * df["buy_volume"] - v
+    flow = delta.rolling(5).sum() / v.rolling(5).sum().replace(0, np.nan)
+    r, a = rsi(c), atr(df)
+    trending = adx(df) > adx_min
+    participation = v > v.rolling(20).mean()
+    sane_vol = a.rolling(200, min_periods=50).rank(pct=True) < 0.9
+    long = {"htf_trend": up, "ema_stack": (e20 > e50) & (c > e50), "adx": trending,
+            "pullback_held": (l.rolling(3).min() <= e20) & (c > e20),
+            "strong_candle": (c > o) & (clv > 0.6), "order_flow": flow > flow_min,
+            "volume": participation, "rsi_room": r.between(45, 70), "volatility": sane_vol}
+    short = {"htf_trend": dn, "ema_stack": (e20 < e50) & (c < e50), "adx": trending,
+             "pullback_held": (h.rolling(3).max() >= e20) & (c < e20),
+             "strong_candle": (c < o) & (clv < 0.4), "order_flow": flow < -flow_min,
+             "volume": participation, "rsi_room": r.between(30, 55), "volatility": sane_vol}
+    return long, short
+
+
+def s_confluence(df, tf, htf_factor=4, adx_min=20, flow_min=0.0, **_):
+    """Only fires when ALL confluence filters agree (see confluence_filters)."""
+    long, short = confluence_filters(df, tf, htf_factor, adx_min, flow_min)
+    all_ = lambda d: np.logical_and.reduce([x.fillna(False).astype(bool).values for x in d.values()])
+    return _sig(pd.Series(all_(long), index=df.index), pd.Series(all_(short), index=df.index))
 
 
 STRATEGIES = {
@@ -220,6 +261,10 @@ STRATEGIES = {
         "fn": s_htf_trend, "desc": "RSI-50 re-cross in the direction of the higher-timeframe EMA trend.",
         "default": {"htf_factor": 4, "htf_ema": 50, "stop_atr": 1.5, "rr": 2.0, "max_hold": 60},
         "grid": {"htf_factor": [3, 4, 6], "htf_ema": [30, 50, 100], "stop_atr": [1.5, 2.0], "rr": [1.5, 2.0, 3.0]}},
+    "confluence": {
+        "fn": s_confluence, "desc": "Strong signals only: HTF trend + ADX + held EMA pullback + order flow + volume all agree.",
+        "default": {"htf_factor": 4, "adx_min": 20, "flow_min": 0.0, "stop_atr": 2.0, "rr": 2.0, "max_hold": 60},
+        "grid": {"htf_factor": [4, 6], "adx_min": [20, 25], "flow_min": [0.0, 0.05], "stop_atr": [1.5, 2.0, 2.5], "rr": [1.5, 2.0, 3.0]}},
 }
 
 

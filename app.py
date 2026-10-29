@@ -1,5 +1,7 @@
 import os
 
+import config  # noqa: F401  (loads .env before os.environ is read)
+
 import requests
 from flask import Flask, request
 

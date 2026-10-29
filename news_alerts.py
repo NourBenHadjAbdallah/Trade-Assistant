@@ -13,6 +13,8 @@ import hashlib
 import html
 import json
 import os
+
+import config  # noqa: F401  (loads .env before os.environ is read)
 import re
 import threading
 import time

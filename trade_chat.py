@@ -27,6 +27,8 @@ Env vars: OLLAMA_HOST (default http://localhost:11434), OLLAMA_MODEL.
 import argparse
 import json
 import os
+
+import config  # noqa: F401  (loads .env before os.environ is read)
 import sys
 
 import requests

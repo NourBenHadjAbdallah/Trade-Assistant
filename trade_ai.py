@@ -23,10 +23,13 @@ import argparse
 import json
 import os
 
+import config  # noqa: F401  (loads .env before os.environ is read)
+
 import numpy as np
 import pandas as pd
 
 import trade_assistant as ta
+import trade_backtest as tb
 
 DEFAULT_MODEL = os.environ.get("TRADE_AI_MODEL", "claude-sonnet-5-5")
 
@@ -167,7 +170,7 @@ def snapshot(df, tf):
         "delta_estimated": bool(df.attrs.get("delta_estimated", False)),
         "meaning": REGIME_TEXT[regime][1],
     }
-    snap["_raw"] = {"vp": vp, "res": res}
+    snap["_raw"] = {"vp": vp, "res": res, "df": df}
     return snap
 
 
@@ -287,6 +290,38 @@ def check_trigger(d, low):
     return conds
 
 
+CONFLUENCE_TEXT = {
+    "htf_trend": "Higher-timeframe trend points the same way",
+    "ema_stack": "EMA20/EMA50 stacked in the trade direction",
+    "adx": "ADX > 20 (market is actually trending)",
+    "pullback_held": "Pulled back to EMA20 and held",
+    "strong_candle": "Decisive candle closing near its extreme",
+    "order_flow": "Net taker delta (last 5 bars) backs the trade",
+    "volume": "Volume above its 20-bar average",
+    "rsi_room": "RSI has room to run (not stretched)",
+    "volatility": "Volatility not in its top 10%",
+}
+
+
+def closed_bars(df, tf):
+    """Drop the still-forming last candle (live Binance data) so checks don't flip mid-bar."""
+    mins = tb.TF_MIN.get(tf)
+    if mins and len(df) > 1:
+        now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+        if df["time"].iloc[-1] + pd.Timedelta(minutes=mins) > now:
+            return df.iloc[:-1]
+    return df
+
+
+def confluence_checks(df, tf, d):
+    """Backtested 'confluence' strategy filters on the last CLOSED bar. [(text, ok)] for direction d."""
+    if tf not in tb.TF_MIN or len(df) < 60:
+        return []
+    long, short = tb.confluence_filters(closed_bars(df, tf), tf)
+    return [(CONFLUENCE_TEXT[k], bool(v.fillna(False).iloc[-1]))
+            for k, v in (long if d > 0 else short).items()]
+
+
 def position_size(account, risk_pct, entry, risk):
     risk_amt = account * risk_pct / 100.0
     units = risk_amt / risk if risk > 0 else 0.0
@@ -311,12 +346,13 @@ def build_plan(provider, symbol, style="Intraday", account=1000.0, risk_pct=1.0)
             "strategy": {"name": strat_name, "key": key, "why": why},
             "direction": "LONG" if d > 0 else "SHORT" if d < 0 else "NONE",
             "setup": None, "confidence": None, "invalidation": [], "avoid": AVOID[key],
-            "notes": []}
+            "notes": [], "strong": False, "grade": "none", "waiting": []}
     if any(s["delta_estimated"] for s in snaps):
         plan["notes"].append("Delta is estimated from candle closes (no aggressor data): order-flow signals are weaker.")
 
     agree = sum(1 for s in snaps if d != 0 and _sign(s["dir"]) == d)
     plan["alignment"] = f"{agree}/3 timeframes agree" if d != 0 else "n/a"
+    plan["agree"] = agree
 
     if d != 0:
         lv = build_levels(d, key, mid)
@@ -327,6 +363,10 @@ def build_plan(provider, symbol, style="Intraday", account=1000.0, risk_pct=1.0)
         lv["triggered"] = met >= 2
         lv["side"] = plan["direction"]
         lv["size"] = position_size(account, risk_pct, lv["entry"], lv["risk"])
+        conf = confluence_checks(mid["_raw"]["df"], mid["tf"], d)
+        conf_ok = sum(1 for _, ok in conf if ok)
+        flow_ok = any(ok for t, ok in conf if t == CONFLUENCE_TEXT["order_flow"])
+        lv["confluence"], lv["confluence_met"] = conf, conf_ok
         plan["setup"] = lv
 
         # confidence with visible breakdown
@@ -351,6 +391,11 @@ def build_plan(provider, symbol, style="Intraday", account=1000.0, risk_pct=1.0)
             factors.append((f"Fading a range while {top['tf']} trends", -10))
         if any(s["delta_estimated"] for s in snaps):
             factors.append(("Delta is estimated, not real aggressor data", -5))
+        if conf:
+            # 9 checks: all pass = +16, 5 pass = 0, fewer = penalty
+            factors.append((f"{mid['tf']} confluence checklist {conf_ok}/{len(conf)}", (conf_ok - 5) * 4))
+            if not flow_ok:
+                factors.append((f"{mid['tf']} order flow does not back the trade (best backtested filter)", -10))
         score = int(np.clip(sum(p for _, p in factors), 0, 100))
         lab = "HIGH" if score >= 70 else "MEDIUM" if score >= 45 else "LOW"
         plan["confidence"] = {"score": score, "label": lab, "factors": factors}
@@ -369,19 +414,163 @@ def build_plan(provider, symbol, style="Intraday", account=1000.0, risk_pct=1.0)
             waiting.append("price to reach the entry zone")
         if not lv["triggered"]:
             waiting.append(f"{low['tf']} confirmation (2 of 3 trigger checks)")
-        if score >= 55 and not waiting:
+        if conf and not flow_ok:
+            waiting.append(f"{mid['tf']} order flow to confirm")
+        strong = (not waiting and score >= 70 and agree == 3 and met == 3 and lv["rr1"] >= 1.5
+                  and conf and conf_ok == len(conf))
+        plan["strong"], plan["waiting"] = bool(strong), waiting
+        if strong:
+            plan["verdict"] = f"STRONG {plan['direction']} SIGNAL: every check passed"
+            plan["verdict_tag"], plan["grade"] = ("long" if d > 0 else "short"), "strong"
+        elif score >= 55 and not waiting:
             plan["verdict"], plan["verdict_tag"] = f"ACTIONABLE {plan['direction']}", "long" if d > 0 else "short"
+            plan["grade"] = "actionable"
         elif score >= 40:
             plan["verdict"] = f"SETUP FORMING ({plan['direction']}): waiting for " + " and ".join(waiting or ["more confidence"])
-            plan["verdict_tag"] = "h"
+            plan["verdict_tag"], plan["grade"] = "h", "forming"
         else:
             plan["verdict"], plan["verdict_tag"] = f"LOW-QUALITY {plan['direction']} SETUP: skip", "muted"
+            plan["grade"] = "skip"
     else:
         plan["verdict"], plan["verdict_tag"] = "NO TRADE: no edge right now", "muted"
         plan["invalidation"].append("Re-check when price reaches a value-area edge or the timeframes re-align.")
 
     plan["tf"] = [{k: v for k, v in s.items() if k != "_raw"} for s in snaps[::-1]]   # high -> low
     return plan
+
+
+# ----------------------------------------------------------------------------
+# Recommendation: one action + the insights behind it, ranked by weight
+# ----------------------------------------------------------------------------
+ACTIONS = {   # grade -> (action, tone, suggested max risk % per trade)
+    "strong": ("{side}", "{tone}", 1.0),
+    "actionable": ("{side}", "{tone}", 0.5),
+    "forming": ("WAIT FOR ENTRY", "wait", 0.0),
+    "skip": ("AVOID", "avoid", 0.0),
+    "none": ("STAND ASIDE", "avoid", 0.0),
+}
+
+
+def insights(plan):
+    """(pro, con): lists of (weight, text) from the plan's data, strongest first."""
+    d = {"LONG": 1, "SHORT": -1}.get(plan["direction"], 0)
+    pro, con = [], []
+    if d == 0:
+        return pro, con
+    top, mid, low = plan["tf"]                       # high -> low
+    s = plan["setup"]
+    up = "up" if d > 0 else "down"
+
+    def add(ok, w, yes, no=None):
+        if ok:
+            pro.append((w, yes))
+        elif no:
+            con.append((w, no))
+
+    agree = plan.get("agree", 0)
+    add(agree == 3, 3, f"All 3 timeframes point {up}",
+        f"Only {agree}/3 timeframes point {up}" if agree <= 1 else None)
+    want = "trend_up" if d > 0 else "trend_down"
+    against = "trend_down" if d > 0 else "trend_up"
+    if top["regime"] == want:
+        pro.append((3, f"{top['tf']} is in a clean {up}trend: trading with the big picture"))
+    elif top["regime"] == against:
+        con.append((3, f"{top['tf']} trends the other way: this is a countertrend trade"))
+    elif top["regime"] == "range":
+        con.append((1, f"{top['tf']} is ranging: moves tend to stall at the range edges"))
+
+    flow = d * mid["delta_bias"]
+    who = "Buyers" if d > 0 else "Sellers"
+    if flow > 0.05:
+        pro.append((3, f"{who} are aggressive on {mid['tf']}: net taker delta {mid['delta_bias']:+.0%}"))
+    elif flow < -0.05:
+        con.append((3, f"Order flow fights the trade on {mid['tf']}: net taker delta {mid['delta_bias']:+.0%}"))
+    bad_div = "bearish" if d > 0 else "bullish"
+    for t in plan["tf"]:
+        if t["divergence"] == bad_div:
+            con.append((2, f"{t['tf']} CVD divergence: the last price extreme was not backed by volume delta"))
+        elif t["divergence"]:
+            pro.append((2, f"{t['tf']} CVD divergence supports the trade (sellers/buyers exhausted)"))
+
+    p = mid["price"]
+    if d * (p - mid["poc"]) > 0:
+        pro.append((1, f"Price trades on the {('upper' if d > 0 else 'lower')} side of the {mid['tf']} volume POC "
+                       f"({mid['poc']:.6g}): value is accepted in your direction"))
+    if (d > 0 and p < mid["val"]) or (d < 0 and p > mid["vah"]):
+        con.append((2, f"Price is outside value against you on {mid['tf']}: the market rejected this side"))
+    if (d > 0 and mid["rsi"] > 70) or (d < 0 and mid["rsi"] < 30):
+        con.append((2, f"{mid['tf']} RSI {mid['rsi']:.0f} is stretched: late entry, pullback risk"))
+    if top["vol_pct"] > 0.9:
+        con.append((2, f"{top['tf']} volatility is in its top 10%: wider swings, size down"))
+
+    if s:
+        add(s["rr1"] >= 2, 2, f"Reward is {s['rr1']:.1f}x the risk to the first target",
+            f"Reward to T1 is only {s['rr1']:.1f}x the risk" if s["rr1"] < 1.5 else None)
+        add(s["in_zone"], 2, "Price is inside the entry zone now", "Price is not at the entry zone yet: do not chase")
+        n, m = len(s.get("confluence") or []), s.get("confluence_met", 0)
+        if n:
+            add(m >= 8, 2, f"Confluence checklist {m}/{n} passed",
+                f"Confluence checklist only {m}/{n}" if m <= 5 else None)
+            if not any(ok for t, ok in s["confluence"] if t == CONFLUENCE_TEXT["order_flow"]):
+                con.append((3, "Recent order flow does not confirm (the most reliable filter in backtests)"))
+    if any(t["delta_estimated"] for t in plan["tf"]):
+        con.append((1, "Order flow is estimated, not real aggressor data"))
+    by_w = lambda x: -x[0]
+    return sorted(pro, key=by_w), sorted(con, key=by_w)
+
+
+def recommend(plan):
+    """Rule-based recommendation for the GUI / scanner. Not financial advice."""
+    grade = plan.get("grade", "none")
+    d = {"LONG": 1, "SHORT": -1}.get(plan["direction"], 0)
+    side, tone = ("BUY", "long") if d > 0 else ("SELL", "short")
+    act, tn, risk = ACTIONS[grade]
+    act, tn = act.format(side=side), tn.format(tone=tone)
+    pro, con = insights(plan)
+    s = plan["setup"]
+    if grade in ("strong", "actionable"):
+        head = ("Strong " if grade == "strong" else "") + f"{plan['direction'].lower()} setup: entry conditions met"
+        nxt = (f"Enter {s['zone_lo']:.6g} - {s['zone_hi']:.6g}, stop {s['stop']:.6g}. "
+               f"Take half at {s['t1']:.6g}, move stop to entry, rest to {s['t2']:.6g}.")
+    elif grade == "forming":
+        head = f"{plan['direction'].capitalize()} idea forming, not ready yet"
+        nxt = (f"Set an alert at {s['entry']:.6g}. Waiting for: " + ", ".join(plan.get("waiting") or ["more confidence"]) + ".")
+    elif grade == "skip":
+        head = f"Weak {plan['direction'].lower()} setup: more against it than for it"
+        nxt = "Skip it. Low-quality trades are where most losses come from."
+    else:
+        head = "No clear edge right now"
+        nxt = "Wait for the timeframes to line up or for price to reach a value-area edge."
+    return {"action": act, "tone": tn, "grade": grade, "headline": head, "next_step": nxt,
+            "max_risk_pct": risk, "pro": [t for _, t in pro], "con": [t for _, t in con],
+            "score": (plan["confidence"] or {}).get("score", 0)}
+
+
+GRADE_RANK = {"strong": 0, "actionable": 1, "forming": 2, "skip": 3, "none": 4}
+
+
+def scan(provider, symbols, style="Intraday", workers=4, on_result=None):
+    """Build plan + recommendation for many coins in parallel. Returns rows sorted best first."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(sym):
+        try:
+            plan = build_plan(provider, sym, style)
+            row = {"symbol": sym, "plan": plan, "rec": recommend(plan), "error": None}
+        except Exception as e:
+            row = {"symbol": sym, "plan": None, "rec": None, "error": str(e)}
+        if on_result:
+            on_result(row)
+        return row
+
+    with ThreadPoolExecutor(workers) as ex:
+        rows = list(ex.map(one, symbols))
+    return sorted(rows, key=scan_key)
+
+
+def scan_key(row):
+    rec = row["rec"]
+    return (9, 0) if rec is None else (GRADE_RANK[rec["grade"]], -rec["score"])
 
 
 # ----------------------------------------------------------------------------
@@ -428,6 +617,11 @@ def render_plan_lines(plan):
         add("TRIGGER CHECKS", "h")
         for txt, ok in s["trigger"]:
             add(f"  [{'x' if ok else ' '}] {txt}", None if ok else "muted")
+        if s.get("confluence"):
+            add()
+            add(f"CONFLUENCE CHECKLIST ({s['confluence_met']}/{len(s['confluence'])}, last closed {plan['tfs'][1]} bar)", "h")
+            for txt, ok in s["confluence"]:
+                add(f"  [{'x' if ok else ' '}] {txt}", None if ok else "muted")
         z = s["size"]
         add()
         add("POSITION SIZE", "h")
