@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-trade_chat.py - talk with your trade assistant using a LOCAL Ollama model.
+trade_chat.py - talk with your trade assistant. Default: a LOCAL Ollama model (free, private).
+Optional: --backend claude uses Claude (your Claude subscription via Claude Code, or ANTHROPIC_API_KEY).
 
 Put it in the same folder as trade_ai.py, trade_assistant.py and trade_journal.py.
 
@@ -13,6 +14,7 @@ Run:
     python trade_chat.py                       # live Binance data
     python trade_chat.py --demo                # synthetic data
     python trade_chat.py --symbol ETHUSDT --style Swing --model llama3.1:8b
+    python trade_chat.py --backend claude      # Claude instead of Ollama
 
 Commands inside the chat:
     /plan [SYMBOL] [STYLE]   build a fresh multi-timeframe plan (STYLE: Scalp, Intraday, Swing, Position)
@@ -22,15 +24,18 @@ Commands inside the chat:
     /reset                   forget the conversation
     /quit                    exit
 
-Env vars: OLLAMA_HOST (default http://localhost:11434), OLLAMA_MODEL.
+Env vars (.env): OLLAMA_HOST (default http://localhost:11434), OLLAMA_MODEL, CLAUDE_MODEL, ANTHROPIC_API_KEY.
 """
 import argparse
 import json
 import os
+
+import config  # noqa: F401  (loads .env before os.environ is read)
 import sys
 
 import requests
 
+import claude_coach as cc
 import trade_ai as ai
 
 try:
@@ -132,6 +137,17 @@ def ask_ollama(question, plan=None, history=None, journal_text=None, model=DEFAU
     return "".join(parts).strip()
 
 
+BACKENDS = ("ollama", "claude")
+
+
+def ask(question, plan=None, history=None, journal_text=None, backend="ollama", model=None, on_token=None):
+    """One entry point for the coach. backend: 'ollama' (default, local) or 'claude'."""
+    if backend == "claude":
+        msgs = list(history or [])[-12:] + [{"role": "user", "content": question}]
+        return cc.ask(build_system(plan, journal_text), msgs, model, on_token)
+    return ask_ollama(question, plan, history, journal_text, model=model or DEFAULT_MODEL, on_token=on_token)
+
+
 # ----------------------------------------------------------------------------
 # Journal + plan helpers
 # ----------------------------------------------------------------------------
@@ -158,19 +174,25 @@ def make_plan(symbol, style, account, risk, demo):
 # Chat loop
 # ----------------------------------------------------------------------------
 def main():
-    p = argparse.ArgumentParser(description="Discuss your trade plan with a local Ollama model")
+    p = argparse.ArgumentParser(description="Discuss your trade plan with the coach (local Ollama, or Claude)")
     p.add_argument("--symbol", default="BTCUSDT")
     p.add_argument("--style", choices=list(ai.STYLES), default="Intraday")
     p.add_argument("--account", type=float, default=1000.0)
     p.add_argument("--risk", type=float, default=1.0, help="risk per trade, percent of account")
-    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--backend", choices=BACKENDS, default="ollama")
+    p.add_argument("--model", help=f"default: {DEFAULT_MODEL} (ollama) / {cc.CLAUDE_MODEL} (claude)")
     p.add_argument("--demo", action="store_true", help="synthetic data instead of Binance")
     a = p.parse_args()
 
-    try:
-        model = check_ollama(a.model)
-    except RuntimeError as e:
-        sys.exit(str(e))
+    if a.backend == "claude":
+        if cc.mode() is None:
+            sys.exit(cc.status_text())
+        model = a.model or cc.CLAUDE_MODEL
+    else:
+        try:
+            model = check_ollama(a.model or DEFAULT_MODEL)
+        except RuntimeError as e:
+            sys.exit(str(e))
 
     state = {"symbol": a.symbol.upper(), "style": a.style, "plan": None, "history": [], "model": model}
 
@@ -185,8 +207,8 @@ def main():
     def say(question):
         print(f"\nCoach ({state['model']}): ", end="", flush=True)
         try:
-            ans = ask_ollama(question, state["plan"], state["history"], journal_text(),
-                             model=state["model"], on_token=lambda t: print(t, end="", flush=True))
+            ans = ask(question, state["plan"], state["history"], journal_text(), a.backend,
+                      model=state["model"], on_token=lambda t: print(t, end="", flush=True))
         except RuntimeError as e:
             print(f"\n[{e}]\n")
             return

@@ -13,6 +13,8 @@ import hashlib
 import html
 import json
 import os
+
+import config  # noqa: F401  (loads .env before os.environ is read)
 import re
 import threading
 import time
@@ -82,7 +84,7 @@ def local_hm(ts):
 # ---------- state ----------
 def _load():
     try:
-        with open(STATE_PATH) as f:
+        with open(STATE_PATH, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {"users": {}, "seen": []}
@@ -91,7 +93,7 @@ def _load():
 def _save(st):
     st["seen"] = st["seen"][-3000:]
     tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(st, f)
     os.replace(tmp, STATE_PATH)
 

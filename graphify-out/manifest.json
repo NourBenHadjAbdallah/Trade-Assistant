@@ -1,0 +1,146 @@
+{
+  ".claude/settings.json": {
+    "mtime": 1793291990.7944171,
+    "seen": 1793292079.2488184,
+    "ast_hash": "c3c314957038fc7ecfa0e083556d4377",
+    "semantic_hash": ""
+  },
+  ".vscode/settings.json": {
+    "mtime": 1792877346.6136875,
+    "seen": 1793292079.2488313,
+    "ast_hash": "da0c0152819c573b6767c46ed8946e9f",
+    "semantic_hash": ""
+  },
+  "app.py": {
+    "mtime": 1793291107.5311618,
+    "seen": 1793292079.2488377,
+    "ast_hash": "7cd30366d3841b39adfdb0e997cdb7ed",
+    "semantic_hash": ""
+  },
+  "config.py": {
+    "mtime": 1793291101.3235512,
+    "seen": 1793292079.2488415,
+    "ast_hash": "45dcdfaa3b5467e4281ae5774aead8a7",
+    "semantic_hash": ""
+  },
+  "conftest.py": {
+    "mtime": 1792877179.2947276,
+    "seen": 1793292079.2488449,
+    "ast_hash": "14f7e04f7b1fbbbbc724e24d0081ab81",
+    "semantic_hash": ""
+  },
+  "news_alerts.py": {
+    "mtime": 1793292432.9159057,
+    "seen": 1793292848.4555104,
+    "ast_hash": "a86a305de26cfa039628ae028d22c239",
+    "semantic_hash": ""
+  },
+  "pyproject.toml": {
+    "mtime": 1792877341.7321384,
+    "seen": 1793292079.24885,
+    "ast_hash": "d905121ce0e09ace3e791d28e342548a",
+    "semantic_hash": ""
+  },
+  "tests/test_audit.py": {
+    "mtime": 1793292813.7055888,
+    "seen": 1793292848.4555173,
+    "ast_hash": "3c7d5cc3122249a63105733d6762b6fa",
+    "semantic_hash": ""
+  },
+  "trade_ai.py": {
+    "mtime": 1793293402.5777316,
+    "seen": 1793293919.365196,
+    "ast_hash": "ae88b712e933ba239e70e13b2dc28ff1",
+    "semantic_hash": ""
+  },
+  "trade_assistant.py": {
+    "mtime": 1792758320.422974,
+    "seen": 1793292079.248857,
+    "ast_hash": "c69b4fdda9ab2ba05f9986b3378c2f00",
+    "semantic_hash": ""
+  },
+  "trade_assistant_gui.py": {
+    "mtime": 1793293906.8498816,
+    "seen": 1793293919.3652027,
+    "ast_hash": "8433adb0e9295e3bd07c17b538efc8b9",
+    "semantic_hash": ""
+  },
+  "trade_backtest.py": {
+    "mtime": 1793292417.2658398,
+    "seen": 1793292848.455533,
+    "ast_hash": "1918290b636f48dc001a1eca8fdae39b",
+    "semantic_hash": ""
+  },
+  "trade_chat.py": {
+    "mtime": 1793292713.1320105,
+    "seen": 1793292848.4555397,
+    "ast_hash": "3da2ffd795108d973a10982b23dcc17c",
+    "semantic_hash": ""
+  },
+  "trade_journal.py": {
+    "mtime": 1793292426.3981597,
+    "seen": 1793292848.455546,
+    "ast_hash": "afb89dd33312aa706a15e548ddd948dc",
+    "semantic_hash": ""
+  },
+  "trade_replay.py": {
+    "mtime": 1792865092.866577,
+    "seen": 1793292079.2488692,
+    "ast_hash": "40ea664f74e796cdfec6fb10ed99461a",
+    "semantic_hash": ""
+  },
+  "AUDIT.md": {
+    "mtime": 1792877045.1621895,
+    "seen": 1793292079.2488716,
+    "ast_hash": "735346ea177ba68f4e3e04d705ddbb24",
+    "semantic_hash": ""
+  },
+  "CLAUDE.md": {
+    "mtime": 1793291990.7592258,
+    "seen": 1793292079.248874,
+    "ast_hash": "67d88e9d0760c3ba54c75dfd9551c1c5",
+    "semantic_hash": ""
+  },
+  "requirements.txt": {
+    "mtime": 1792774088.7940261,
+    "seen": 1793292079.2488766,
+    "ast_hash": "ce232d0d39eddc00ed3c76141545b55d",
+    "semantic_hash": ""
+  },
+  "runtime.txt": {
+    "mtime": 1792772160.8361492,
+    "seen": 1793292079.248879,
+    "ast_hash": "05beaf7a693f082dc53613ff42e4331e",
+    "semantic_hash": ""
+  },
+  ".icon_cache/btc.png": {
+    "mtime": 1792764256.1039095,
+    "seen": 1793292079.248881,
+    "ast_hash": "8f8d12b8691a706a99e7544bd33527c2",
+    "semantic_hash": ""
+  },
+  ".icon_cache/ltc.png": {
+    "mtime": 1792764267.7696164,
+    "seen": 1793292079.2488835,
+    "ast_hash": "95507ffd15fb458032339c7dc775ed70",
+    "semantic_hash": ""
+  },
+  "claude_coach.py": {
+    "mtime": 1793292691.5759187,
+    "seen": 1793292848.4554954,
+    "ast_hash": "3dfd34a05ac549fc08539fced0706f98",
+    "semantic_hash": ""
+  },
+  "signal_log.py": {
+    "mtime": 1793293447.898157,
+    "seen": 1793293919.3651836,
+    "ast_hash": "cbfd869789add5c89f1584e60f9c94e6",
+    "semantic_hash": ""
+  },
+  "tests/test_signal_log.py": {
+    "mtime": 1793293553.480751,
+    "seen": 1793293919.3651917,
+    "ast_hash": "88b4f286618b38c756d8278eb0a4c236",
+    "semantic_hash": ""
+  }
+}

@@ -95,9 +95,12 @@ def fetch_history(symbol, tf, years=2.0, use_cache=True):
     if df.empty:
         raise RuntimeError("No data returned (check the symbol and your connection).")
     df = df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
-    df = df.iloc[:-1]                                     # drop the still-forming last candle
-    df.to_csv(path, index=False)
-    cut = pd.Timestamp.now() - pd.Timedelta(days=int(years * 365))
+    # keep closed candles only (Binance times are UTC). Never trims rows that were already cached.
+    now_utc = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    df = df[df["time"] + pd.Timedelta(minutes=TF_MIN[tf]) <= now_utc].reset_index(drop=True)
+    if new is not None:
+        df.to_csv(path, index=False)
+    cut = now_utc - pd.Timedelta(days=int(years * 365))
     return df[df["time"] >= cut].reset_index(drop=True)
 
 
@@ -112,7 +115,7 @@ def demo_history(tf="1h", years=2.0, seed=1):
         drift[i:i + L] = rng.choice([-1, 0, 0, 1]) * 0.0003
         i += L
     vol = 0.004 * np.exp(np.cumsum(rng.normal(0, 0.02, n)) * 0.2)
-    close = 100 * np.exp(np.cumsum(rng.normal(drift, vol)))
+    close = 100 * np.exp(np.cumsum(rng.normal(drift - 0.5 * vol ** 2, vol)))   # Ito term: no hidden upward drift
     open_ = np.r_[close[0], close[:-1]]
     high = np.maximum(open_, close) * (1 + rng.uniform(0, 0.003, n))
     low = np.minimum(open_, close) * (1 - rng.uniform(0, 0.003, n))
@@ -186,21 +189,62 @@ def s_mean_reversion(df, tf, rsi_lo=30, adx_max=25, **_):
     return _sig((r < rsi_lo) & (c < mid - 2 * sd) & ranging, (r > 100 - rsi_lo) & (c > mid + 2 * sd) & ranging)
 
 
-def s_htf_trend(df, tf, htf_factor=4, htf_ema=50, **_):
-    """Trade RSI-50 re-crosses only in the direction of the higher timeframe trend (no lookahead)."""
+def htf_state(df, tf, htf_factor=4, htf_ema=50):
+    """(up, dn) bool arrays: higher-timeframe trend as known at the START of each HTF bar (no lookahead)."""
     g = df.set_index("time")
     rule = f"{TF_MIN[tf] * htf_factor}min"
     hc = g["close"].resample(rule).last().dropna()
     e = ema(hc, htf_ema)
-    up = ((hc > e) & (e > e.shift(3))).shift(1)           # state known at the START of each HTF bar
+    up = ((hc > e) & (e > e.shift(3))).shift(1)
     dn = ((hc < e) & (e < e.shift(3))).shift(1)
-    up = up.reindex(g.index, method="ffill").fillna(False).astype(bool).values
-    dn = dn.reindex(g.index, method="ffill").fillna(False).astype(bool).values
+    up = up.astype(float).reindex(g.index, method="ffill").fillna(0).astype(bool).values
+    dn = dn.astype(float).reindex(g.index, method="ffill").fillna(0).astype(bool).values
+    return up, dn
+
+
+def s_htf_trend(df, tf, htf_factor=4, htf_ema=50, **_):
+    """Trade RSI-50 re-crosses only in the direction of the higher timeframe trend (no lookahead)."""
+    up, dn = htf_state(df, tf, htf_factor, htf_ema)
     r = rsi(df["close"]).values
     rp = np.r_[np.nan, r[:-1]]
     long = pd.Series(up & (rp < 50) & (r >= 50), index=df.index)
     short = pd.Series(dn & (rp > 50) & (r <= 50), index=df.index)
     return _sig(long, short)
+
+
+def confluence_filters(df, tf, htf_factor=4, adx_min=20, flow_min=0.0, **_):
+    """
+    Named bool Series per side: every independent check a 'strong' signal must pass.
+    Trend (HTF + EMA stack + ADX), pullback to EMA20 that held, decisive candle,
+    order flow (net taker delta), participation (volume), momentum not stretched, sane volatility.
+    """
+    c, o, h, l, v = (df[k] for k in ("close", "open", "high", "low", "volume"))
+    e20, e50 = ema(c, 20), ema(c, 50)
+    up, dn = (pd.Series(x, index=df.index) for x in htf_state(df, tf, htf_factor, 50))
+    rng = (h - l).replace(0, np.nan)
+    clv = ((c - l) / rng).fillna(0.5)
+    delta = 2 * df["buy_volume"] - v
+    flow = delta.rolling(5).sum() / v.rolling(5).sum().replace(0, np.nan)
+    r, a = rsi(c), atr(df)
+    trending = adx(df) > adx_min
+    participation = v > v.rolling(20).mean()
+    sane_vol = a.rolling(200, min_periods=50).rank(pct=True) < 0.9
+    long = {"htf_trend": up, "ema_stack": (e20 > e50) & (c > e50), "adx": trending,
+            "pullback_held": (l.rolling(3).min() <= e20) & (c > e20),
+            "strong_candle": (c > o) & (clv > 0.6), "order_flow": flow > flow_min,
+            "volume": participation, "rsi_room": r.between(45, 70), "volatility": sane_vol}
+    short = {"htf_trend": dn, "ema_stack": (e20 < e50) & (c < e50), "adx": trending,
+             "pullback_held": (h.rolling(3).max() >= e20) & (c < e20),
+             "strong_candle": (c < o) & (clv < 0.4), "order_flow": flow < -flow_min,
+             "volume": participation, "rsi_room": r.between(30, 55), "volatility": sane_vol}
+    return long, short
+
+
+def s_confluence(df, tf, htf_factor=4, adx_min=20, flow_min=0.0, **_):
+    """Only fires when ALL confluence filters agree (see confluence_filters)."""
+    long, short = confluence_filters(df, tf, htf_factor, adx_min, flow_min)
+    all_ = lambda d: np.logical_and.reduce([x.fillna(False).astype(bool).values for x in d.values()])
+    return _sig(pd.Series(all_(long), index=df.index), pd.Series(all_(short), index=df.index))
 
 
 STRATEGIES = {
@@ -220,23 +264,32 @@ STRATEGIES = {
         "fn": s_htf_trend, "desc": "RSI-50 re-cross in the direction of the higher-timeframe EMA trend.",
         "default": {"htf_factor": 4, "htf_ema": 50, "stop_atr": 1.5, "rr": 2.0, "max_hold": 60},
         "grid": {"htf_factor": [3, 4, 6], "htf_ema": [30, 50, 100], "stop_atr": [1.5, 2.0], "rr": [1.5, 2.0, 3.0]}},
+    "confluence": {
+        "fn": s_confluence, "desc": "Strong signals only: HTF trend + ADX + held EMA pullback + order flow + volume all agree.",
+        "default": {"htf_factor": 4, "adx_min": 20, "flow_min": 0.0, "stop_atr": 2.0, "rr": 2.0, "max_hold": 60},
+        "grid": {"htf_factor": [4, 6], "adx_min": [20, 25], "flow_min": [0.0, 0.05], "stop_atr": [1.5, 2.0, 2.5], "rr": [1.5, 2.0, 3.0]}},
 }
 
 
 # ----------------------------------------------------------------------------
 # Engine
 # ----------------------------------------------------------------------------
-def backtest(df, strategy, tf, params=None, cost=COST_PER_SIDE, start_idx=0):
+EXIT_PARAMS = ("stop_atr", "rr", "max_hold")
+
+
+def backtest(df, strategy, tf, params=None, cost=COST_PER_SIDE, start_idx=0, sig=None, atr_arr=None):
     """
     Returns a DataFrame of trades (entry_idx, exit_idx, time, side, entry, r, reason).
     Signals are computed on the whole `df` (so indicators are warmed up) but only trades
     entering at index >= start_idx are kept: this is how out-of-sample slices are tested.
+    sig / atr_arr: precomputed arrays for `df` (the optimizer reuses them across exit-only variants).
     """
     spec = STRATEGIES[strategy]
     p = {**spec["default"], **(params or {})}
     stop_atr, rr, max_hold = p["stop_atr"], p["rr"], int(p["max_hold"])
-    sig = spec["fn"](df, tf, **p)
-    a = atr(df).values
+    if sig is None:
+        sig = spec["fn"](df, tf, **p)
+    a = atr(df).values if atr_arr is None else atr_arr
     o, h, l, c = (df[k].values for k in ("open", "high", "low", "close"))
     t = df["time"].values
     n, out, i = len(df), [], max(start_idx - 1, 0)
@@ -252,7 +305,9 @@ def backtest(df, strategy, tf, params=None, cost=COST_PER_SIDE, start_idx=0):
             hit_stop = l[j] <= stop if side > 0 else h[j] >= stop
             hit_tgt = h[j] >= tgt if side > 0 else l[j] <= tgt
             if hit_stop:                                  # stop wins ties (pessimistic)
-                r, reason = -1.0, "stop"
+                # a candle that opens beyond the stop fills at its open (gap), not at the stop
+                fill = min(o[j], stop) if side > 0 else max(o[j], stop)
+                r, reason = side * (fill - entry) / risk, "stop"
                 break
             if hit_tgt:
                 r, reason = rr, "target"
@@ -315,7 +370,9 @@ def monte_carlo(r, n_trades=100, risk_pct=1.0, sims=5000, ruin_dd=30.0, seed=0):
     paths = rng.choice(r, size=(sims, n_trades), replace=True)
     eq = 100 * np.cumprod(np.maximum(1 + paths * risk_pct / 100, 0), axis=1)
     final = eq[:, -1]
-    dd = ((np.maximum.accumulate(eq, axis=1) - eq) / np.maximum.accumulate(eq, axis=1)).max(axis=1) * 100
+    eq0 = np.column_stack([np.full(sims, 100.0), eq])     # include the starting balance as the first peak
+    peak = np.maximum.accumulate(eq0, axis=1)
+    dd = ((peak - eq0) / peak).max(axis=1) * 100
     return {"n_trades": n_trades, "risk_pct": risk_pct, "prob_profit": float((final > 100).mean()),
             "median_ret": float(np.median(final) - 100), "p5_ret": float(np.percentile(final, 5) - 100),
             "p95_ret": float(np.percentile(final, 95) - 100), "median_dd": float(np.median(dd)),
@@ -323,12 +380,14 @@ def monte_carlo(r, n_trades=100, risk_pct=1.0, sims=5000, ruin_dd=30.0, seed=0):
 
 
 def kelly(s, fraction=0.25, cap=2.0):
-    """Fractional Kelly risk % per trade from win rate and payoff. 0 if no edge. Capped."""
+    """Fractional Kelly risk % per trade from win rate and payoff. 0 unless the edge is statistically proven."""
     if not s or s["avg_loss"] == 0 or s["avg_win"] <= 0:
+        return 0.0
+    if s["n"] < 30 or s["expectancy"] <= 0 or s["exp_ci"][0] <= 0:
         return 0.0
     b, p = s["avg_win"] / abs(s["avg_loss"]), s["win_rate"]
     k = p - (1 - p) / b
-    if s["n"] < 100 or s["exp_ci"][0] <= 0:      # weak evidence: never suggest more than a small size
+    if s["n"] < 100:                             # proven but thin sample: keep it small
         cap = min(cap, 0.5)
     return float(min(max(k, 0) * fraction * 100, cap))
 
@@ -358,8 +417,14 @@ def optimize(df, strategy, tf, train_end, min_trades=20, cost=COST_PER_SIDE):
     """Pick params on data[:train_end] only. Score = t-stat of expectancy (rewards consistency, not luck)."""
     best, best_score, rows = None, -1e9, []
     combos = grid_combos(strategy)
+    train = df.iloc[:train_end]
+    spec, a, sigs = STRATEGIES[strategy], atr(train).values, {}
     for prm in combos:
-        tr = backtest(df.iloc[:train_end], strategy, tf, prm, cost)
+        # signals only depend on entry params: compute once per entry set, reuse for every stop/target variant
+        key = tuple(sorted((k, v) for k, v in prm.items() if k not in EXIT_PARAMS))
+        if key not in sigs:
+            sigs[key] = spec["fn"](train, tf, **{**spec["default"], **prm})
+        tr = backtest(train, strategy, tf, prm, cost, sig=sigs[key], atr_arr=a)
         if len(tr) < min_trades:
             continue
         r = tr["r"].values
@@ -435,7 +500,7 @@ def fmt_stats(s, mc, kel=None, title=""):
         L.append(f"  Drawdown: median {mc['median_dd']:.0f}%, 95th pct {mc['p95_dd']:.0f}% | "
                  f"chance of a {mc['ruin_dd']:.0f}%+ drawdown: {mc['prob_ruin']:.0%}")
     if kel is not None:
-        L.append(f"  Suggested risk (quarter-Kelly, capped 2%; 0.5% if evidence is weak): {kel:.2f}% per trade" + ("  (no edge: 0)" if kel == 0 else ""))
+        L.append(f"  Suggested risk (quarter-Kelly, capped 2%; 0 unless the edge is proven): {kel:.2f}% per trade" + ("  (no edge: 0)" if kel == 0 else ""))
     L.append("  >> " + verdict(s, mc))
     return "\n".join(L)
 
@@ -464,16 +529,17 @@ def report_optimize(df, strategy, tf, risk_pct=1.0, cost=COST_PER_SIDE):
     L.append(f"  Chosen params: {res['params']}   ({res['trials']} variants tried)")
     L.append("  " + robustness(res["table"]))
     L.append(fmt_stats(*analyse(res["train"]["r"].values, res["trials"], risk_pct), title="IN-SAMPLE (optimistic, ignore)"))
-    L.append(fmt_stats(*analyse(res["oos"]["r"].values, res["trials"], risk_pct), title="OUT-OF-SAMPLE (this is the number that matters)"))
+    # the holdout is evaluated once, so no multiple-testing penalty here (it belongs to the in-sample pick)
+    L.append(fmt_stats(*analyse(res["oos"]["r"].values, 1, risk_pct), title="OUT-OF-SAMPLE (this is the number that matters)"))
     return "\n".join(L), res
 
 
 def report_walkforward(df, strategy, tf, risk_pct=1.0, cost=COST_PER_SIDE):
-    pooled, log, trials = walk_forward(df, strategy, tf, 4, cost)
+    pooled, log, _ = walk_forward(df, strategy, tf, 4, cost)
     L = [f"=== {strategy} WALK-FORWARD (re-optimised before every test window)"]
     for t, prm, n, e in log:
         L.append(f"  from {t:%Y-%m-%d}: " + (f"{n} trades, {e:+.2f}R avg  params {prm}" if prm else "no usable params"))
-    L.append(fmt_stats(*analyse(pooled["r"].values if len(pooled) else [], trials, risk_pct), title="POOLED OUT-OF-SAMPLE"))
+    L.append(fmt_stats(*analyse(pooled["r"].values if len(pooled) else [], 1, risk_pct), title="POOLED OUT-OF-SAMPLE"))
     return "\n".join(L), pooled
 
 
@@ -550,11 +616,11 @@ def run_backtest(symbol="BTCUSDT", tf="1h", strategy="all", mode="default", year
         if mode == "optimize":
             txt, res = report_optimize(df, nme, tf, risk_pct)
             tdf = res["oos"] if res and res.get("oos") is not None else pd.DataFrame(columns=TRADE_COLS)
-            r, split, trials = tdf["r"].values, None, (res or {}).get("trials", 1)
+            r, split, trials = tdf["r"].values, None, 1
         elif mode == "walkforward":
             txt, pooled = report_walkforward(df, nme, tf, risk_pct)
             tdf = pooled if len(pooled) else pd.DataFrame(columns=TRADE_COLS)
-            r, split, trials = tdf["r"].values, None, len(grid_combos(nme)) * 4
+            r, split, trials = tdf["r"].values, None, 1
         else:
             txt, full, _ = report_default(df, nme, tf, risk_pct)
             tdf, r, split, trials = full, full["r"].values, int((full["entry_idx"] < cut).sum()), 1

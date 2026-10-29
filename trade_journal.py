@@ -88,14 +88,15 @@ def stats(df):
         best = max(best, streak)
 
     # revenge trading: opened within 30 minutes of closing a loser
+    # (compared against every losing close, so overlapping positions don't hide it)
+    loss_closes = d.loc[(d["r"] <= 0) & d["close_time"].notna(), "close_time"].values
     revenge = []
-    ordered = d.sort_values("open_time").reset_index(drop=True)
-    for i in range(1, len(ordered)):
-        p, t = ordered.iloc[i - 1], ordered.iloc[i]
-        if p["r"] <= 0 and pd.notna(p["close_time"]) and pd.notna(t["open_time"]):
-            gap = (t["open_time"] - p["close_time"]).total_seconds() / 60
-            if 0 <= gap <= 30:
-                revenge.append(float(t["r"]))
+    for t in d.itertuples():
+        if pd.isna(t.open_time) or not len(loss_closes):
+            continue
+        gap = (np.datetime64(t.open_time) - loss_closes) / np.timedelta64(1, "m")
+        if ((gap >= 0) & (gap <= 30)).any():
+            revenge.append(float(t.r))
     s = {
         "n": len(d), "win_rate": float((r > 0).mean()), "avg_win_r": float(wins.mean()) if len(wins) else 0.0,
         "avg_loss_r": float(losses.mean()) if len(losses) else 0.0, "expectancy_r": float(r.mean()),
