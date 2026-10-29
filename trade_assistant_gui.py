@@ -67,6 +67,13 @@ except Exception as _e:
     AI_ERR = str(_e)
 
 try:
+    import signal_log as sl
+    SL_ERR = None
+except Exception as _e:
+    sl = None
+    SL_ERR = str(_e)
+
+try:
     import trade_chat as tc
     COACH_ERR = None
 except Exception as _e:
@@ -116,7 +123,6 @@ COACH_BUBBLE_BG = "#1E2330"
 CARD = "#181D28"
 TONE = {"long": GREEN, "short": RED, "wait": AMBER, "avoid": MUTED}
 REGIME_COLOR = {"trend_up": GREEN, "trend_down": RED, "range": "#4DA3FF", "transition": AMBER}
-STABLES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "EUR", "USDE", "XUSD", "USD1", "PAXG", "WBTC", "RLUSD", "USDS", "BFUSD", "PYUSD"}
 SCAN_EVERY_MS = 15 * 60 * 1000
 
 LINE_COLORS = ["#FFB300", "#C77DFF", "#4DD0E1", "#FF8A65", "#AED581", "#F06292"]
@@ -194,12 +200,6 @@ def get_klines(symbol, interval, limit):
         except Exception as e:
             last = e
     raise RuntimeError(f"Could not reach Binance. Check your internet connection.\n({last})")
-
-
-def scan_symbols(coins, n):
-    """Top-n tradeable coins (drops stablecoins and wrapped assets)."""
-    out = [c for c in coins if c.endswith("USDT") and c[:-4] not in STABLES]
-    return out[:n]
 
 
 # UI building blocks
@@ -383,8 +383,10 @@ class App(ctk.CTk):
         self._update_icon()
 
     def _update_icon(self):
+        sym = self.symbol_var.get()          # read Tk variables on the UI thread only
+
         def _fetch():
-            icon = get_coin_icon(self.symbol_var.get())
+            icon = get_coin_icon(sym)
             self.q.put((lambda: self.logo_label.configure(image=icon, text="" if icon else "🪙"), ()))
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -407,6 +409,7 @@ class App(ctk.CTk):
         self.tabview.pack(fill="both", expand=True, padx=6, pady=6)
 
         tab_s = self.tabview.add("Signals")
+        tab_t = self.tabview.add("Track record")
         tab_a = self.tabview.add("Analysis")
         tab_c = self.tabview.add("Coach")
         tab_n = self.tabview.add("News")
@@ -422,6 +425,7 @@ class App(ctk.CTk):
                                             border_color=PANEL_BORDER, wrap="none")      # shown only when the switch is on
 
         self._build_signals_tab(tab_s)
+        self._build_track_tab(tab_t)
         self._build_coach_tab(tab_c)
         self._build_news_tab(tab_n)
         self._build_backtest_tab(tab_b)
@@ -513,11 +517,13 @@ class App(ctk.CTk):
         except Exception:
             return
         if models:
-            self.ollama_models = models
-            if self.backend_var.get() == "Ollama":
-                pick = tc.DEFAULT_MODEL if tc.DEFAULT_MODEL in models else models[0]
-                self.q.put((lambda: self.model_cb.configure(values=models), ()))
-                self.model_var.set(pick)
+            self.q.put((self._models_loaded, (models,)))     # widgets are updated on the UI thread
+
+    def _models_loaded(self, models):
+        self.ollama_models = models
+        if self.backend_var.get() == "Ollama":
+            self.model_cb.configure(values=models)
+            self.model_var.set(tc.DEFAULT_MODEL if tc.DEFAULT_MODEL in models else models[0])
 
     def _coach_backend(self, choice):
         """Ollama (default, local) or Claude (subscription via Claude Code, or API key)."""
@@ -738,7 +744,7 @@ class App(ctk.CTk):
     def _sig_scan(self, auto=False):
         if ai is None or self.sig_busy:
             return
-        coins = scan_symbols(self.coins, int(self.sig_n.get()))
+        coins = ai.scan_symbols(self.coins, int(self.sig_n.get()))
         style = self.style_var.get()
         self.sig_busy, self.sig_done_n, self.sig_total = True, 0, len(coins)
         self.sig_btn.configure(state="disabled", text="...")
@@ -748,14 +754,21 @@ class App(ctk.CTk):
         def work():
             rows = ai.scan(lambda s, tf: get_klines(s, tf, 500), coins, style, 4,
                            on_result=lambda _r: self.q.put((self._sig_progress, ())))
-            self.q.put((self._sig_done, (rows, style, auto)))
+            logged = 0
+            if sl is not None:                       # track record: log new signals, grade the open ones
+                try:
+                    logged = sl.record(rows)
+                    sl.update()
+                except Exception as e:
+                    self.q.put((self.status_var.set, (f"Track record not updated: {e}",)))
+            self.q.put((self._sig_done, (rows, style, auto, logged)))
         threading.Thread(target=work, daemon=True).start()
 
     def _sig_progress(self):
         self.sig_done_n += 1
         self.sig_prog.set(self.sig_done_n / max(self.sig_total, 1))
 
-    def _sig_done(self, rows, style, auto):
+    def _sig_done(self, rows, style, auto, logged=0):
         self.sig_busy = False
         self.sig_btn.configure(state="normal", text="Scan")
         self.sig_rows = rows
@@ -765,13 +778,15 @@ class App(ctk.CTk):
         forming = sum(1 for r in ok if r["rec"]["grade"] == "forming")
         self.sig_info.configure(text=f"Last scan {pd.Timestamp.now():%H:%M} · {style} · {len(ok)} coins: "
                                      f"{ready} ready, {forming} forming"
-                                     + (f", {len(rows) - len(ok)} failed" if len(ok) < len(rows) else ""))
+                                     + (f", {len(rows) - len(ok)} failed" if len(ok) < len(rows) else "")
+                                     + (f" · {logged} new logged to Track record" if logged else ""))
         new = strong - self.sig_strong
         if auto and new:
             self.bell()
             self.status_var.set("New STRONG signal: " + ", ".join(sorted(new)))
         self.sig_strong = strong
         self._sig_render()
+        self._tr_refresh()
 
     def _sig_render(self):
         if not hasattr(self, "sig_list"):
@@ -808,6 +823,140 @@ class App(ctk.CTk):
             why = rec["pro"][0] if rec["pro"] else (rec["con"][0] if rec["con"] else "")
             if why:
                 text(f, ("✓ " if rec["pro"] else "✗ ") + why, GREEN if rec["pro"] else RED, 10, wrap=440, padx=10, pady=(0, 8))
+
+    # ---------------- Track record ----------------
+    def _build_track_tab(self, parent):
+        if sl is None:
+            ctk.CTkLabel(parent, text=f"Track record unavailable.\n{SL_ERR}", text_color=RED, justify="left").pack(
+                fill="both", expand=True, padx=12, pady=12)
+            return
+        text(parent, "Every signal the scanner gives is logged here and graded against what price did next, "
+                     "following the app's own plan (fees included). This is how you find out if the signals work.",
+             MUTED, 11, wrap=470, pady=(6, 4))
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        bar.pack(fill="x", padx=4, pady=2)
+        self.tr_btn = ctk.CTkButton(bar, text="Update results", width=120, font=("Segoe UI", 11, "bold"),
+                                    fg_color=BLUE, command=self._tr_update)
+        self.tr_btn.pack(side="left", padx=4)
+        self.tr_info = ctk.CTkLabel(bar, text="", font=("Segoe UI", 10), text_color=MUTED)
+        self.tr_info.pack(side="left", padx=8)
+        self.tr_body = ctk.CTkScrollableFrame(parent, fg_color=BG, corner_radius=8)
+        self.tr_body.pack(fill="both", expand=True, padx=4, pady=4)
+        self.tr_fig = Figure(figsize=(4.6, 1.8), dpi=100)
+        self._tr_refresh()
+
+    def _tr_update(self):
+        self.tr_btn.configure(state="disabled", text="Updating...")
+
+        def work():
+            try:
+                msg = f"{sl.update()} signal(s) changed status."
+            except Exception as e:
+                msg = f"Update failed: {e}"
+            self.q.put((self._tr_updated, (msg,)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _tr_updated(self, msg):
+        self.tr_btn.configure(state="normal", text="Update results")
+        self.status_var.set("Track record: " + msg)
+        self._tr_refresh()
+
+    def _tr_refresh(self):
+        if sl is None or not hasattr(self, "tr_body"):
+            return
+        try:
+            df = sl.load()
+        except Exception as e:
+            self.tr_info.configure(text=f"Could not read the log: {e}")
+            return
+        self.tr_info.configure(text=f"Updated {pd.Timestamp.now():%H:%M}")
+        self._tr_render(df, sl.summary(df))
+
+    def _tr_table(self, title, rows):
+        c = card(self.tr_body, title)
+        g = ctk.CTkFrame(c, fg_color="transparent")
+        g.pack(fill="x", padx=12, pady=(2, 10))
+        for j, h in enumerate(("", "closed", "win rate", "avg R", "total R")):
+            ctk.CTkLabel(g, text=h, font=("Segoe UI", 10), text_color=MUTED, anchor="w").grid(
+                row=0, column=j, sticky="w", padx=(0, 14))
+        for i, (name, b) in enumerate(rows, start=1):
+            done = b["closed"] > 0
+            vals = [name, str(b["closed"]),
+                    f"{b['win_rate']:.0%}" if done else "–",
+                    f"{b['avg_r']:+.2f}" if done else "–",
+                    f"{b['total_r']:+.1f}" if done else "–"]
+            for j, v in enumerate(vals):
+                col = (GREEN if b["avg_r"] > 0 else RED) if done and j >= 3 else FG
+                ctk.CTkLabel(g, text=v, font=("Segoe UI", 11, "bold" if j == 0 else "normal"), text_color=col,
+                             anchor="w").grid(row=i, column=j, sticky="w", padx=(0, 14), pady=1)
+
+    def _tr_render(self, df, s):
+        body = self.tr_body
+        for w in body.winfo_children():
+            w.destroy()
+        if df.empty:
+            text(body, "No signals logged yet. They are added automatically after each scan in the Signals tab "
+                       "(only BUY / SELL, STRONG and WAIT FOR ENTRY signals).", MUTED, wrap=440, pady=12)
+            return
+        a = s["all"]
+        done = a["closed"] > 0
+        tiles = ctk.CTkFrame(body, fg_color="transparent")
+        tiles.pack(fill="x", padx=2, pady=(4, 2))
+        stats = [("Signals", f"{a['signals']}", FG),
+                 ("Closed trades", f"{a['closed']}", FG),
+                 ("Win rate", f"{a['win_rate']:.0%}" if done else "–", FG),
+                 ("Avg per trade", f"{a['avg_r']:+.2f}R" if done else "–",
+                  (GREEN if a["avg_r"] > 0 else RED) if done else MUTED)]
+        for i, (k, v, col) in enumerate(stats):
+            tiles.grid_columnconfigure(i, weight=1, uniform="kpi")
+            box = ctk.CTkFrame(tiles, fg_color=CARD, corner_radius=10, border_width=1, border_color=PANEL_BORDER)
+            box.grid(row=0, column=i, sticky="nsew", padx=3)
+            ctk.CTkLabel(box, text=v, font=("Segoe UI", 18, "bold"), text_color=col).pack(pady=(8, 0))
+            ctk.CTkLabel(box, text=k, font=("Segoe UI", 10), text_color=MUTED).pack(pady=(0, 8))
+
+        tone = AMBER if a["closed"] < 30 else GREEN if a["avg_r"] > 0 else RED
+        c = card(body, border=tone)
+        text(c, s["verdict"], tone, 12, True, pady=(10, 2))
+        text(c, f"{a['open']} open · {a['pending']} waiting for entry · {a['expired']} expired"
+                + (f" · {a['fill_rate']:.0%} of decided signals got filled" if a["fill_rate"] is not None else "")
+                + f" · total {a['total_r']:+.1f}R", MUTED, 10, pady=(0, 10))
+
+        if s["curve"]:
+            c = card(body, "Cumulative result (R, after fees)")
+            fig = self.tr_fig
+            fig.clear()
+            fig.patch.set_facecolor(CARD)
+            ax = fig.add_subplot(111)
+            style_ax(ax)
+            ax.set_facecolor(CARD)
+            curve = [0.0] + s["curve"]
+            ax.plot(curve, color=GREEN if curve[-1] >= 0 else RED, lw=1.6)
+            ax.axhline(0, color="#9AA3B5", lw=0.8)
+            ax.set_xlabel("closed trade #", color=MUTED, fontsize=8)
+            fig.subplots_adjust(left=0.1, right=0.97, top=0.95, bottom=0.25)
+            FigureCanvasTkAgg(fig, master=c).get_tk_widget().pack(fill="x", padx=6, pady=(0, 8))
+
+        self._tr_table("By signal type", s["by_grade"])
+        self._tr_table("By confidence score (higher should win more)", s["by_score"])
+
+        c = card(body, "Recent signals")
+        status_pill = {"pending": ("WAITING", MUTED), "open": ("OPEN", BLUE), "expired": ("EXPIRED", "#3A4152")}
+        for _, r in df.sort_values("id", ascending=False).head(15).iterrows():
+            row = ctk.CTkFrame(c, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=2)
+            side_txt, side_col = ("BUY", GREEN) if r["side"] > 0 else ("SELL", RED)
+            pill(row, side_txt, side_col, 9).pack(side="left")
+            ctk.CTkLabel(row, text=r["symbol"].replace("USDT", ""), font=("Segoe UI", 12, "bold"),
+                         text_color=FG, width=60, anchor="w").pack(side="left", padx=6)
+            ctk.CTkLabel(row, text=f"{sl.GRADE_LABEL.get(r['grade'], r['grade'])} · {r['score']}/100 · "
+                                   f"{r['created']:%m-%d %H:%M} UTC", font=("Segoe UI", 10), text_color=MUTED).pack(side="left")
+            if r["status"] == "closed":
+                won = r["r"] > 0
+                pill(row, f"{'WIN' if won else 'LOSS'} {r['r']:+.2f}R", GREEN if won else RED, 9).pack(side="right")
+            else:
+                lab, col = status_pill.get(r["status"], (str(r["status"]).upper(), MUTED))
+                pill(row, lab, col, 9).pack(side="right")
+        ctk.CTkFrame(c, fg_color="transparent", height=6).pack()
 
     def _open_symbol(self, sym):
         self.symbol_var.set(sym)

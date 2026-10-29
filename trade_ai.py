@@ -568,6 +568,29 @@ def scan_key(row):
     return (9, 0) if rec is None else (GRADE_RANK[rec["grade"]], -rec["score"])
 
 
+STABLES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "EUR", "USDE", "XUSD", "USD1", "PAXG", "WBTC",
+           "RLUSD", "USDS", "BFUSD", "PYUSD"}
+TICKER_URLS = ["https://api.binance.com/api/v3/ticker/24hr", "https://data-api.binance.vision/api/v3/ticker/24hr"]
+
+
+def scan_symbols(coins, n):
+    """Top-n tradeable coins (drops stablecoins and wrapped assets)."""
+    out = [c for c in coins if c.endswith("USDT") and c[:-4] not in STABLES]
+    return out[:n]
+
+
+def top_symbols(n=20):
+    """Most traded USDT coins on Binance right now, stablecoins removed."""
+    import requests
+    for url in TICKER_URLS:
+        try:
+            rows = [(d["symbol"], float(d["quoteVolume"])) for d in requests.get(url, timeout=10).json()]
+            return scan_symbols([s for s, _ in sorted(rows, key=lambda r: -r[1])], n)
+        except Exception:
+            continue
+    raise RuntimeError("Could not reach Binance to list the top coins.")
+
+
 # ----------------------------------------------------------------------------
 # Rendering (list of (text, tag)); tags: h, long, short, warn, muted, None
 # ----------------------------------------------------------------------------
