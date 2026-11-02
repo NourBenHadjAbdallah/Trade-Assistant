@@ -13,7 +13,8 @@ the app itself recommends:
   * stop and target inside the same candle -> stop first (pessimistic); fees as in trade_backtest.py
 Results are in R (1R = the risk between entry and stop).
 
-CLI (works without the GUI; a Windows scheduled task runs `scan` every 15 min, log in signal_scan.log):
+CLI (works without the GUI; a Windows scheduled task runs `scan` every 15 min, log in signal_scan.log;
+`scan` also checks price alerts):
     python signal_log.py scan --style Intraday --coins 20     # scan, log new signals, grade open ones
     python signal_log.py update                               # grade open signals only
     python signal_log.py report                               # print the track record
@@ -255,6 +256,12 @@ def main():
         import trade_ai as ai
         rows = ai.scan(ai.binance_provider, ai.top_symbols(a.coins), a.style)
         print(f"Logged {record(rows)} new signal(s). {update()} signal(s) changed status.")
+        try:                                             # same schedule rings price alerts (Telegram if set up)
+            import price_alerts as pa
+            for f in pa.check():
+                print(f["message"])
+        except Exception as e:
+            print(f"Price alerts not checked: {e}")
     elif a.cmd == "update":
         print(f"{update()} signal(s) changed status.")
     print(report_text())

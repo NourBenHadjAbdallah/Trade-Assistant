@@ -228,6 +228,15 @@ def choose_strategy(top, mid, bias):
     return 0, "none", "No edge (mixed signals)", why
 
 
+STOP_ATR = 1.5          # stop distance in ATRs of the setup timeframe (tighter stops get hit by normal noise)
+MAX_FEE_R = 0.25        # round-trip fees may cost at most this share of the risk (risk_manager uses the same)
+
+
+def stop_distance(entry, a, cost=tb.COST_PER_SIDE):
+    """ATR stop, widened when needed so fees stay under MAX_FEE_R (matters on low timeframes)."""
+    return max(STOP_ATR * a, 2 * cost * entry / MAX_FEE_R)
+
+
 def build_levels(d, key, mid):
     a, p = mid["atr"], mid["price"]
     vp, res = mid["_raw"]["vp"], mid["_raw"]["res"]
@@ -235,11 +244,9 @@ def build_levels(d, key, mid):
     names = []
     if key == "range":
         entry = vp["val"] if d > 0 else vp["vah"]
-        stop = entry - d * 0.6 * a
         names = ["VAL" if d > 0 else "VAH"]
     elif key == "breakout":
         entry = vp["vah"] if d > 0 else vp["val"]
-        stop = entry - d * 0.8 * a
         names = ["VAH retest" if d > 0 else "VAL retest"]
     else:
         sc = [s for s in res["scenarios"] if s[0].startswith("LONG" if d > 0 else "SHORT")]
@@ -247,8 +254,8 @@ def build_levels(d, key, mid):
             entry, names = float(sc[0][1]["price"]), list(sc[0][1]["names"])
         else:
             entry = p
-        stop = entry - d * 0.6 * a
-    entry, stop = float(entry), float(stop)
+    entry = float(entry)
+    stop = entry - d * stop_distance(entry, a)
     risk = abs(entry - stop)
     if d > 0:
         cands = sorted(c["price"] for c in clusters if c["price"] > entry + 0.9 * risk)
@@ -343,7 +350,8 @@ def build_plan(provider, symbol, style="Intraday", account=1000.0, risk_pct=1.0)
             "strategy": {"name": strat_name, "key": key, "why": why},
             "direction": "LONG" if d > 0 else "SHORT" if d < 0 else "NONE",
             "setup": None, "confidence": None, "invalidation": [], "avoid": AVOID[key],
-            "notes": [], "strong": False, "grade": "none", "waiting": []}
+            "notes": [], "strong": False, "grade": "none", "waiting": [],
+            "_dfs": dict(zip(tfs, dfs))}            # raw candles per timeframe (entry timer)
     if any(s["delta_estimated"] for s in snaps):
         plan["notes"].append("Delta is estimated from candle closes (no aggressor data): order-flow signals are weaker.")
 
@@ -569,7 +577,7 @@ def scan_key(row):
 
 
 STABLES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "EUR", "USDE", "XUSD", "USD1", "PAXG", "WBTC",
-           "RLUSD", "USDS", "BFUSD", "PYUSD"}
+           "RLUSD", "USDS", "BFUSD", "PYUSD", "U"}
 TICKER_URLS = ["https://api.binance.com/api/v3/ticker/24hr", "https://data-api.binance.vision/api/v3/ticker/24hr"]
 
 

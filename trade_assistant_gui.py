@@ -67,6 +67,15 @@ except Exception as _e:
     AI_ERR = str(_e)
 
 try:
+    import price_alerts as pa
+    import risk_manager as rm
+    import time_machine as tmach
+    TOOLS_ERR = None
+except Exception as _e:
+    pa = rm = tmach = None
+    TOOLS_ERR = str(_e)
+
+try:
     import signal_log as sl
     SL_ERR = None
 except Exception as _e:
@@ -124,6 +133,8 @@ CARD = "#181D28"
 TONE = {"long": GREEN, "short": RED, "wait": AMBER, "avoid": MUTED}
 REGIME_COLOR = {"trend_up": GREEN, "trend_down": RED, "range": "#4DA3FF", "transition": AMBER}
 SCAN_EVERY_MS = 15 * 60 * 1000
+ALERT_EVERY_MS = 30 * 1000
+ENTRY_COLOR = {"waiting": MUTED, "in_zone": AMBER, "triggered": GREEN, "invalid": RED, "expired": "#3A4152"}
 
 LINE_COLORS = ["#FFB300", "#C77DFF", "#4DD0E1", "#FF8A65", "#AED581", "#F06292"]
 FALLBACK_COINS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT",
@@ -411,6 +422,7 @@ class App(ctk.CTk):
         tab_s = self.tabview.add("Signals")
         tab_t = self.tabview.add("Track record")
         tab_a = self.tabview.add("Analysis")
+        tab_al = self.tabview.add("Alerts")
         tab_c = self.tabview.add("Coach")
         tab_n = self.tabview.add("News")
         tab_b = self.tabview.add("Backtest")
@@ -426,6 +438,7 @@ class App(ctk.CTk):
 
         self._build_signals_tab(tab_s)
         self._build_track_tab(tab_t)
+        self._build_alerts_tab(tab_al)
         self._build_coach_tab(tab_c)
         self._build_news_tab(tab_n)
         self._build_backtest_tab(tab_b)
@@ -580,6 +593,9 @@ class App(ctk.CTk):
                     plan = ai.build_plan(lambda s, tf: get_klines(s, tf, 500), sym, style)
                     rec = ai.recommend(plan)
                     buf.write("\n\n" + ai.render_plan_text(plan))
+                    if pa is not None and plan.get("setup"):
+                        plan["_entry"] = pa.plan_entry_state(plan)
+                        plan["_risk"] = rm.check(plan)
                 except Exception as e:
                     plan_err = f"Multi-timeframe plan failed: {e}"
             self.q.put((self._show, (sym, interval, df, vp, avwaps, of_df, res, buf.getvalue(), plan, rec, plan_err)))
@@ -660,6 +676,9 @@ class App(ctk.CTk):
                     row=i, column=0, sticky="nw", pady=2)
                 ctk.CTkLabel(grid, text=v, font=("Segoe UI", 12, "bold"), text_color=col, anchor="w", justify="left",
                              wraplength=320).grid(row=i, column=1, sticky="w", pady=2)
+
+        if s and pa is not None:
+            self._render_trade_tools(body, plan)
 
         if rec["pro"] or rec["con"]:
             c = card(body, "Key insights")
@@ -823,6 +842,245 @@ class App(ctk.CTk):
             why = rec["pro"][0] if rec["pro"] else (rec["con"][0] if rec["con"] else "")
             if why:
                 text(f, ("✓ " if rec["pro"] else "✗ ") + why, GREEN if rec["pro"] else RED, 10, wrap=440, padx=10, pady=(0, 8))
+
+    # ---------------- Entry timer, risk check, time machine (analysis) ----------------
+    def _render_trade_tools(self, body, plan):
+        st = plan.get("_entry")
+        c = card(body, "Entry timer")
+        if st:
+            row = ctk.CTkFrame(c, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=(2, 2))
+            pill(row, st["state"].replace("_", " ").upper(), ENTRY_COLOR[st["state"]], 10).pack(side="left")
+            ctk.CTkLabel(row, text=f"on {plan['tfs'][0]} candles", font=("Segoe UI", 10),
+                         text_color=MUTED).pack(side="left", padx=8)
+            text(c, st["detail"], FG, 11)
+        btns = ctk.CTkFrame(c, fg_color="transparent")
+        btns.pack(fill="x", padx=12, pady=(6, 10))
+        ctk.CTkButton(btns, text="🔔 Alert me for this plan", width=170, fg_color=BLUE,
+                      command=lambda: self._alerts_for_plan(plan)).pack(side="left")
+        ctk.CTkLabel(btns, text="zone, confirmation, stop, T1, T2", font=("Segoe UI", 10),
+                     text_color=MUTED).pack(side="left", padx=8)
+
+        res = plan.get("_risk")
+        if res:
+            ok = res["verdict"] == "PASS"
+            c = card(body, "Risk check", GREEN if ok else RED)
+            head = ctk.CTkFrame(c, fg_color="transparent")
+            head.pack(fill="x", padx=12, pady=(2, 4))
+            pill(head, res["verdict"], GREEN if ok else RED, 12).pack(side="left")
+            z = res["size"]
+            if z:
+                ctk.CTkLabel(head, text=f"{z['units']:.6g} units · {z['notional']:,.0f} USDT · max loss "
+                                        f"{z['max_loss']:,.2f}", font=("Segoe UI", 11), text_color=FG).pack(side="left", padx=8)
+            failed = [r for r in res["rules"] if not r[1]]
+            for name, good, detail in (failed or res["rules"]):
+                bullet_list(c, [f"{name}: {detail}"], "✓" if good else "✗", GREEN if good else RED)
+            if failed and len(failed) < len(res["rules"]):
+                text(c, f"{len(res['rules']) - len(failed)} other checks passed.", MUTED, 10)
+            row = ctk.CTkFrame(c, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=(6, 10))
+            ctk.CTkButton(row, text="Edit my limits", width=110, fg_color="#2A3142",
+                          command=self._edit_limits).pack(side="left")
+            ctk.CTkButton(row, text="I took this trade", width=130, fg_color=GREEN if ok else "#2A3142",
+                          state="normal" if ok else "disabled",
+                          command=lambda: self._record_taken(plan, res)).pack(side="left", padx=6)
+
+        c = card(body, "Time machine")
+        text(c, "Replays this exact plan 10,000 times on the coin's own price moves, and on every past time a "
+                "similar setup fired. Fees included.", MUTED, 10)
+        self.tm_box = ctk.CTkFrame(c, fg_color="transparent")
+        self.tm_box.pack(fill="x", padx=0, pady=(2, 0))
+        self.tm_btn = ctk.CTkButton(c, text="▶ Run time machine", width=160, fg_color=BLUE,
+                                    command=lambda: self._tm_run(plan))
+        self.tm_btn.pack(anchor="w", padx=12, pady=(4, 10))
+
+    def _tm_run(self, plan):
+        self.tm_btn.configure(state="disabled", text="Replaying...")
+        self.status_var.set("Time machine: loading history (the first run per coin downloads a year of candles)...")
+
+        def work():
+            try:
+                self.q.put((self._tm_show, (tmach.run(plan), None)))
+            except Exception as e:
+                self.q.put((self._tm_show, (None, e)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _tm_show(self, r, err):
+        if not self.tm_btn.winfo_exists():
+            return
+        self.tm_btn.configure(state="normal", text="▶ Run again")
+        for w in self.tm_box.winfo_children():
+            w.destroy()
+        if err:
+            text(self.tm_box, f"Time machine failed: {err}", RED, 11)
+            return
+        self.status_var.set("Time machine finished.")
+        for label, p, col in (("Target 1 first", r["p_t1"], GREEN), ("Stop first", r["p_stop"], RED),
+                              ("Neither", r["p_none"], MUTED)):
+            row = ctk.CTkFrame(self.tm_box, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=1)
+            ctk.CTkLabel(row, text=label, font=("Segoe UI", 11), text_color=FG, width=100, anchor="w").pack(side="left")
+            bar = ctk.CTkProgressBar(row, height=10, progress_color=col, fg_color=PANEL_BORDER)
+            bar.set(p)
+            bar.pack(side="left", fill="x", expand=True, padx=6)
+            ctk.CTkLabel(row, text=f"{p:.0%}", font=("Segoe UI", 11, "bold"), text_color=col, width=40).pack(side="left")
+        text(self.tm_box, f"Break-even needs about {r['breakeven']:.0%} at T1. Average {r['avg_r']:+.2f}R per trade "
+                          f"(bad luck {r['r_p10']:+.2f}R, good luck {r['r_p90']:+.2f}R).", FG, 11, pady=(4, 0))
+        if r["hist_n"]:
+            text(self.tm_box, f"History: {r['hist_n']} past setups with {r['hist_checks']}+ checks won "
+                              f"{r['hist_win']:.0%}, average {r['hist_avg_r']:+.2f}R.", FG, 11)
+        tone = GREEN if r["avg_r"] >= 0.1 else RED if r["avg_r"] <= -0.1 else AMBER
+        text(self.tm_box, r["verdict"], tone, 11, True, pady=(4, 0))
+
+    def _record_taken(self, plan, res):
+        try:
+            rm.record_taken(plan, res)
+            self.status_var.set(f"Recorded: {plan['symbol']} {plan['direction']}, max loss "
+                                f"{res['size']['max_loss']:,.2f} USDT counted in today's limits.")
+            self.run()
+        except Exception as e:
+            self.status_var.set(f"Not recorded: {e}")
+
+    def _edit_limits(self):
+        cur = rm.load_settings()
+        win = ctk.CTkToplevel(self)
+        win.title("My risk limits")
+        win.geometry("420x470")
+        win.configure(fg_color=PANEL)
+        win.attributes("-topmost", True)
+        entries = {}
+        for i, (k, lab) in enumerate(rm.LABELS.items()):
+            ctk.CTkLabel(win, text=lab, font=("Segoe UI", 11), text_color=FG, anchor="w").grid(
+                row=i, column=0, sticky="w", padx=14, pady=5)
+            e = ctk.CTkEntry(win, width=150)
+            v = cur[k]
+            e.insert(0, ", ".join(v) if k == "blocked" else f"{v:g}")
+            e.grid(row=i, column=1, padx=10, pady=5)
+            entries[k] = e
+        msg = ctk.CTkLabel(win, text="", font=("Segoe UI", 10), text_color=RED)
+        msg.grid(row=len(entries), column=0, columnspan=2, pady=(6, 0))
+
+        def save():
+            try:
+                rm.save_settings({k: e.get() for k, e in entries.items()})
+            except ValueError as ex:
+                msg.configure(text=str(ex) if "negative" in str(ex) else "Use plain numbers (e.g. 1.5).")
+                return
+            win.destroy()
+            self.status_var.set("Risk limits saved.")
+            self.run()
+        ctk.CTkButton(win, text="Save", fg_color=BLUE, command=save).grid(
+            row=len(entries) + 1, column=0, columnspan=2, pady=12)
+
+    # ---------------- Alerts tab ----------------
+    def _build_alerts_tab(self, parent):
+        if pa is None:
+            ctk.CTkLabel(parent, text=f"Alerts unavailable.\n{TOOLS_ERR}", text_color=RED, justify="left").pack(
+                fill="both", expand=True, padx=12, pady=12)
+            return
+        text(parent, "Alerts ring once (sound + popup), checked every 30 s while the app is open and every 15 min by "
+                     "the scheduled scan. Use 🔔 in the Analysis tab to watch a whole plan.", MUTED, 11, wrap=470, pady=(6, 4))
+        form = ctk.CTkFrame(parent, fg_color="transparent")
+        form.pack(fill="x", padx=4, pady=2)
+        self.al_sym = ctk.CTkEntry(form, width=90, placeholder_text="BTC")
+        self.al_sym.pack(side="left", padx=(4, 4))
+        self.al_kind = ctk.StringVar(value="above")
+        ctk.CTkOptionMenu(form, variable=self.al_kind, values=["above", "below", "% up", "% down"],
+                          width=90).pack(side="left", padx=4)
+        self.al_level = ctk.CTkEntry(form, width=100, placeholder_text="price or %")
+        self.al_level.pack(side="left", padx=4)
+        ctk.CTkButton(form, text="Add", width=60, fg_color=BLUE, command=self._alert_add).pack(side="left", padx=4)
+        tg = "Telegram: on (alerts also go to your phone)" if pa.telegram_ready() else \
+            "Telegram: off. Add TELEGRAM_TOKEN and TELEGRAM_CHAT_ID to .env to get alerts on your phone."
+        text(parent, tg, GREEN if pa.telegram_ready() else MUTED, 10, wrap=470, pady=(2, 2))
+        self.al_list = ctk.CTkScrollableFrame(parent, fg_color=BG, corner_radius=8)
+        self.al_list.pack(fill="both", expand=True, padx=4, pady=4)
+        self.al_busy = False
+        self._alerts_render()
+        self.after(10000, self._alert_tick)
+
+    def _alert_add(self):
+        raw_sym, raw_lvl = self.al_sym.get().strip(), self.al_level.get().strip().replace(",", ".")
+        if raw_sym.replace(".", "", 1).isdigit():
+            self.status_var.set("Alert not added: the first box is the coin (e.g. BTC), the price goes in the third box.")
+            return
+        if not raw_lvl:
+            self.status_var.set("Alert not added: type the price (or the % for % up / % down) in the third box.")
+            return
+        try:
+            sym = normalize_symbol(raw_sym or self.symbol_var.get())
+            kind = {"above": "above", "below": "below", "% up": "pct_up", "% down": "pct_down"}[self.al_kind.get()]
+            pa.add(sym, kind, float(raw_lvl))
+        except Exception as e:
+            self.status_var.set(f"Alert not added: {e}")
+            return
+        self.al_level.delete(0, "end")
+        self.status_var.set(f"Alert added for {sym}.")
+        self._alerts_render()
+
+    def _alerts_for_plan(self, plan):
+        try:
+            n = pa.add_plan(plan)
+        except Exception as e:
+            self.status_var.set(f"Alerts not added: {e}")
+            return
+        self.status_var.set(f"{n} alerts set for {plan['symbol']} (see the Alerts tab).")
+        self._alerts_render()
+
+    def _alert_cancel(self, alert_id):
+        pa.cancel(alert_id)
+        self._alerts_render()
+
+    def _alerts_render(self):
+        if pa is None or not hasattr(self, "al_list"):
+            return
+        for w in self.al_list.winfo_children():
+            w.destroy()
+        df = pa.list_alerts()
+        live = df["status"].isin(["active", "waiting"])
+        active, done = df[live], df[~live].head(12)
+        text(self.al_list, f"ACTIVE ({len(active)})", MUTED, 10, True, pady=(6, 2))
+        if active.empty:
+            text(self.al_list, "No active alerts.", MUTED, 11)
+        for _, a in active.iterrows():
+            row = ctk.CTkFrame(self.al_list, fg_color=CARD, corner_radius=8)
+            row.pack(fill="x", padx=4, pady=2)
+            waiting = a["status"] == "waiting"
+            ctk.CTkLabel(row, text=pa.describe(a) + ("  (armed once the entry zone is reached)" if waiting else ""),
+                         font=("Segoe UI", 11), text_color=MUTED if waiting else FG, anchor="w", justify="left",
+                         wraplength=380).pack(side="left", padx=10, pady=6)
+            ctk.CTkButton(row, text="✕", width=28, height=24, fg_color="#2A3142", hover_color=RED,
+                          command=lambda i=a["id"]: self._alert_cancel(i)).pack(side="right", padx=6)
+        text(self.al_list, "RECENT", MUTED, 10, True, pady=(10, 2))
+        if done.empty:
+            text(self.al_list, "Nothing has rung yet.", MUTED, 11)
+        for _, a in done.iterrows():
+            col = {"fired": GREEN, "invalid": RED, "expired": MUTED, "cancelled": MUTED}.get(a["status"], MUTED)
+            msg = a["message"] if isinstance(a["message"], str) and a["message"] else pa.describe(a)
+            text(self.al_list, f"{a['status'].upper()} · {msg}", col, 10, wrap=440)
+
+    def _alert_tick(self):
+        if not self.al_busy and not pa.list_alerts("active").empty:
+            self.al_busy = True
+
+            def work():
+                try:
+                    fired = pa.check()
+                except Exception:
+                    fired = []
+                self.q.put((self._alerts_fired, (fired,)))
+            threading.Thread(target=work, daemon=True).start()
+        self.after(ALERT_EVERY_MS, self._alert_tick)
+
+    def _alerts_fired(self, fired):
+        self.al_busy = False
+        if not fired:
+            return
+        self._alerts_render()
+        for f in fired:
+            self.status_var.set(f["message"])
+            self._news_popup(f["message"], "Price alert")
+        self.bell()
 
     # ---------------- Track record ----------------
     def _build_track_tab(self, parent):
@@ -1162,10 +1420,10 @@ class App(ctk.CTk):
         self.bell()
         self._news_popup(text)
 
-    def _news_popup(self, text):
+    def _news_popup(self, text, title="News alert"):
         try:
             win = ctk.CTkToplevel(self)
-            win.title("News alert")
+            win.title(title)
             win.geometry("420x230+40+40")
             win.attributes("-topmost", True)
             win.configure(fg_color=PANEL)
